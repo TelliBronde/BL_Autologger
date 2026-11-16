@@ -30,17 +30,28 @@ def reload_disk_modules():
                 print(f"⚠️ Ошибка в модуле {mod_file}: {e}")
 
 
-def sync_modules_from_github():
+def sync_modules_from_github(target_branch=None):
+    """Скачивает все 5 модулей напрямую из выбранной ветки: 'main' (stable) или 'test'."""
     cfg = config.load_config()
-    branch = "test" if cfg.get("channel") == "test" else "main"
+    if target_branch in ("main", "stable"):
+        branch = "main"
+        cfg["channel"] = "stable"
+    elif target_branch == "test":
+        branch = "test"
+        cfg["channel"] = "test"
+    else:
+        branch = "test" if cfg.get("channel") == "test" else "main"
+
+    config.save_config(cfg)
     repo = cfg.get("github_repo", config.GITHUB_REPO)
     token = (cfg.get("github_token") or "").strip()
     headers = {"User-Agent": "BambuFarmControl/2.3", "Cache-Control": "no-cache"}
     if token:
         headers["Authorization"] = f"token {token}"
 
+    print(f"\n🌐 Скачиваем модули из ветки [{branch.upper()}] ({repo})...")
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    bak_dir = config.VERSIONS_DIR / f"backup_{ts}"
+    bak_dir = config.VERSIONS_DIR / f"backup_{ts}_{branch}"
     bak_dir.mkdir(exist_ok=True)
     for m in config.MODULES:
         p = config.HERE / m
@@ -54,16 +65,19 @@ def sync_modules_from_github():
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=6.0) as resp:
                 code_text = resp.read().decode("utf-8-sig")
-            compile(code_text, m, "exec")
+            compile(code_text, m, "exec")  # Проверка синтаксиса перед сохранением
             (config.HERE / m).write_text(code_text, encoding="utf-8")
             updated += 1
-            print(f"  ✅ Обновлён модуль: {m}")
+            print(f"  ✅ Обновлён модуль: {m} (ветка {branch})")
         except Exception as e:
             print(f"  ⚠️ Пропущен {m}: {e}")
 
     if updated:
         reload_disk_modules()
-        print(f"\n🎉 Обновлено модулей: {updated}. Бэкап прошлой версии: {bak_dir.name}")
+        print(f"\n🎉 Успешно обновлено модулей: {updated} из ветки [{branch.upper()}]!")
+        print(f"   Бэкап прошлой версии сохранён в: versions/{bak_dir.name}")
+    else:
+        print("\n❌ Ни один модуль не обновлён. Проверь интернет или GitHub Token.")
 
 
 def rollback_modules():
@@ -71,6 +85,7 @@ def rollback_modules():
     if not backups:
         print("Архив бэкапов пока пуст.")
         return
+    print("\n--- 🗂️ ДОСТУПНЫЕ БЭКАПЫ ДЛЯ ОТКАТА ---")
     for idx, b in enumerate(backups[:10], 1):
         print(f"  [{idx}] {b.name}")
     ch = input("Выбери номер бэкапа для отката (Enter = 1-й самый свежий): ").strip() or "1"
@@ -79,11 +94,33 @@ def rollback_modules():
         for f in chosen.glob("*.py"):
             shutil.copy2(f, config.HERE / f.name)
         reload_disk_modules()
-        print(f"⏪ Модули успешно откачены из {chosen.name}!")
+        print(f"⏪ Все модули успешно восстановлены из {chosen.name}!")
 
 
 def main_menu():
+    # Если запущен Farm_Control.exe, а на диске лежит обновлённый с GitHub main.py — запускаем его через Watchdog
+    disk_main = config.HERE / "main.py"
+    if getattr(sys, "frozen", False) and not globals().get("__DISK_MAIN_ACTIVE__") and disk_main.exists():
+        try:
+            reload_disk_modules()
+            code = disk_main.read_text(encoding="utf-8-sig")
+            g = globals().copy()
+            g["__DISK_MAIN_ACTIVE__"] = True
+            g["__file__"] = str(disk_main)
+            exec(compile(code, str(disk_main), "exec"), g)
+            return
+        except Exception as e:
+            print(f"\n🚨 Сбой во внешнем main.py ({e})! Запускаем встроенное аварийное меню .exe...")
+            time.sleep(2)
+
     reload_disk_modules()
+
+    # Поддержка флагов командной строки: python main.py --stable / --test
+    if "--stable" in sys.argv:
+        sync_modules_from_github("main")
+    elif "--test" in sys.argv:
+        sync_modules_from_github("test")
+
     while True:
         os.system("cls" if os.name == "nt" else "clear")
         cfg = config.load_config()
@@ -97,9 +134,11 @@ def main_menu():
         else:
             status_str = "⚪ Выключена"
 
-        ch_badge = cfg.get("channel", "stable").upper()
+        is_test = cfg.get("channel") == "test"
+        branch_badge = "🧪 ВЕТКА: TEST (test)" if is_test else "🟢 ВЕТКА: STABLE (main)"
+
         print("==========================================================================")
-        print(f"   BAMBU FARM CONTROL — v{config.VERSION} [{ch_badge}] | {cfg.get('github_repo')}")
+        print(f"   BAMBU FARM CONTROL — v{config.VERSION} | {branch_badge}")
         print("==========================================================================")
         print(f" Статус фермы: {status_str} | Одометров: {len(config.load_odometers())} шт.")
         print("--------------------------------------------------------------------------")
@@ -109,7 +148,7 @@ def main_menu():
         print("  [4] 🔴 Живая таблица Excel (автообновление в реальном времени)")
         print("  [5] 🔧 Сверка и ручной ввод моточасов с экрана принтера (Одометр + ТО)")
         print("  [6] 🔄 Ручные повторы за прошлые дни")
-        print("  [7] 🌐 Обновить модули с GitHub / ⏪ Откатить / Переключить ветку")
+        print("  [7] 🌐 GitHub: Обновить из STABLE (main) / TEST (test) / ⏪ Откатить")
         print("  [0] Выход")
         print("==========================================================================")
         choice = input("Выбери пункт меню: ").strip()
@@ -153,20 +192,22 @@ def main_menu():
                         items.pop(int(n) - 1)
                         config.save_manual_reprints(items)
             elif choice == "7":
-                print(f"\nТекущая ветка: [{ch_badge}]")
-                print("[1] 🔄 Обновить модули с GitHub  [2] ⏪ Откатить на бэкап  [3] 🔀 Сменить ветку (main/test)  [4] 🔑 Токен")
+                print("\n--- 🌐 ВЫБОР ВЕТКИ ОБНОВЛЕНИЯ GITHUB ---")
+                print("  [1] 🟢 Обновить из STABLE ветки (main)")
+                print("  [2] 🧪 Обновить из TEST ветки (test)")
+                print("  [3] ⏪ Откатить модули на предыдущий бэкап")
+                print("  [4] 🔑 Указать GitHub Token (для приватного репозитория)")
                 sub = input("> ").strip()
                 if sub == "1":
-                    sync_modules_from_github()
+                    sync_modules_from_github("main")
                 elif sub == "2":
-                    rollback_modules()
+                    sync_modules_from_github("test")
                 elif sub == "3":
-                    cfg["channel"] = "test" if cfg.get("channel") == "stable" else "stable"
-                    config.save_config(cfg)
-                    print(f"🔀 Ветка переключена на: {cfg['channel'].upper()}")
+                    rollback_modules()
                 elif sub == "4":
                     cfg["github_token"] = input("GitHub Token: ").strip()
                     config.save_config(cfg)
+                    print("✅ Токен сохранён!")
                 input("\nНажми Enter...")
             elif choice == "0":
                 break

@@ -31,7 +31,6 @@ def reload_disk_modules():
 
 
 def sync_modules_from_github(target_branch=None):
-    """Скачивает все 5 модулей напрямую из выбранной ветки: 'main' (stable) или 'test'."""
     cfg = config.load_config()
     if target_branch in ("main", "stable"):
         branch = "main"
@@ -45,7 +44,7 @@ def sync_modules_from_github(target_branch=None):
     config.save_config(cfg)
     repo = cfg.get("github_repo", config.GITHUB_REPO)
     token = (cfg.get("github_token") or "").strip()
-    headers = {"User-Agent": "BambuFarmControl/2.3", "Cache-Control": "no-cache"}
+    headers = {"User-Agent": "BambuFarmControl/2.4", "Cache-Control": "no-cache"}
     if token:
         headers["Authorization"] = f"token {token}"
 
@@ -65,7 +64,7 @@ def sync_modules_from_github(target_branch=None):
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=6.0) as resp:
                 code_text = resp.read().decode("utf-8-sig")
-            compile(code_text, m, "exec")  # Проверка синтаксиса перед сохранением
+            compile(code_text, m, "exec")
             (config.HERE / m).write_text(code_text, encoding="utf-8")
             updated += 1
             print(f"  ✅ Обновлён модуль: {m} (ветка {branch})")
@@ -98,7 +97,6 @@ def rollback_modules():
 
 
 def main_menu():
-    # Если запущен Farm_Control.exe, а на диске лежит обновлённый с GitHub main.py — запускаем его через Watchdog
     disk_main = config.HERE / "main.py"
     if getattr(sys, "frozen", False) and not globals().get("__DISK_MAIN_ACTIVE__") and disk_main.exists():
         try:
@@ -115,7 +113,6 @@ def main_menu():
 
     reload_disk_modules()
 
-    # Поддержка флагов командной строки: python main.py --stable / --test
     if "--stable" in sys.argv:
         sync_modules_from_github("main")
     elif "--test" in sys.argv:
@@ -137,15 +134,24 @@ def main_menu():
         is_test = cfg.get("channel") == "test"
         branch_badge = "🧪 ВЕТКА: TEST (test)" if is_test else "🟢 ВЕТКА: STABLE (main)"
 
+        live_st = report.get_live_state()
+        if live_st["active"]:
+            live_header = f"🔴 LIVE-ЗАПИСЬ: ВКЛ (каждые {live_st['interval']}с | обновл. в {live_st['last_update']} | {live_st['file']})"
+            btn4_text = "⏹️ Остановить фоновую Live-запись Excel"
+        else:
+            live_header = "⚪ LIVE-ЗАПИСЬ: ВЫКЛ"
+            btn4_text = "🔴 Включить фоновую Live-запись Excel (автообновление в фоне)"
+
         print("==========================================================================")
         print(f"   BAMBU FARM CONTROL — v{config.VERSION} | {branch_badge}")
         print("==========================================================================")
-        print(f" Статус фермы: {status_str} | Одометров: {len(config.load_odometers())} шт.")
+        print(f" Статус фермы:  {status_str} | Одометров: {len(config.load_odometers())} шт.")
+        print(f" Живая таблица: {live_header}")
         print("--------------------------------------------------------------------------")
         print("  [1] 🚀 Запустить / Перезапустить Ферму + Автологгер")
         print("  [2] 📊 Сформировать полный Excel-отчёт (безопасно поверх открытого)")
         print("  [3] 📅 Отчёт за период (указать начальную и конечную дату вручную)")
-        print("  [4] 🔴 Живая таблица Excel (автообновление в реальном времени)")
+        print(f"  [4] {btn4_text}")
         print("  [5] 🔧 Сверка и ручной ввод моточасов с экрана принтера (Одометр + ТО)")
         print("  [6] 🔄 Ручные повторы за прошлые дни")
         print("  [7] 🌐 GitHub: Обновить из STABLE (main) / TEST (test) / ⏪ Откатить")
@@ -168,8 +174,7 @@ def main_menu():
                 input("\nНажми Enter, чтобы вернуться в меню...")
             elif choice == "4":
                 reload_disk_modules()
-                report.live_excel_monitor_loop()
-                input("\nНажми Enter, чтобы вернуться в меню...")
+                report.toggle_live_excel_background()
             elif choice == "5":
                 reload_disk_modules()
                 report.odometer_reconciliation_menu()
@@ -210,6 +215,7 @@ def main_menu():
                     print("✅ Токен сохранён!")
                 input("\nНажми Enter...")
             elif choice == "0":
+                report.get_live_state()["active"] = False
                 break
         except Exception as e:
             print(f"\n⚠️ Перехвачена ошибка (программа продолжает работу): {e}")

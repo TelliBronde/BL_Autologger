@@ -1,5 +1,8 @@
 import os
+import re
+import subprocess
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -49,20 +52,141 @@ def widths(ws, ws_widths):
         ws.column_dimensions[get_column_letter(i + 1)].width = w
 
 
-def generate_report():
-    res = parser.load_and_parse()
+def parse_user_date(raw_str: str, default_date: str) -> str:
+    """Понимает форматы: ГГГГ-ММ-ДД, ДД.ММ.ГГГГ, ДД/ММ/ГГГГ и короткий ДД.ММ."""
+    s = (raw_str or "").strip()
+    if not s:
+        return default_date
+    # ГГГГ-ММ-ДД
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    # ДД.ММ.ГГГГ или ДД/ММ/ГГГГ
+    m_full = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$", s)
+    if m_full:
+        d, m, y = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
+        return f"{y:04d}-{m:02d}-{d:02d}"
+    # Короткий формат ДД.ММ (год берём текущий)
+    m_short = re.match(r"^(\d{1,2})[./-](\d{1,2})$", s)
+    if m_short:
+        d, m = int(m_short.group(1)), int(m_short.group(2))
+        y = datetime.now().year
+        return f"{y:04d}-{m:02d}-{d:02d}"
+    return default_date
+
+
+def close_workbook_in_excel_com(file_path: Path) -> bool:
+    """Если файл открыт в Excel, мягко закрывает только эту книгу через COM, чтобы снять блокировку записи."""
+    if sys.platform != "win32":
+        return False
+    fname = file_path.name.replace("'", "''")
+    ps_script = (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "$xl=[Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application'); "
+        "if($xl){ "
+        "  $xl.DisplayAlerts=$false; "
+        f"  foreach($wb in $xl.Workbooks){{ if($wb.Name -eq '{fname}'){{ $wb.Close($false); $xl.DisplayAlerts=$true; exit 0 }} }} "
+        "  $xl.DisplayAlerts=$true; "
+        "} exit 1"
+    )
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=4,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if res.returncode == 0:
+            time.sleep(0.3)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def safe_save_and_open(wb: Workbook, export_path: Path, open_file=True) -> Path:
+    """Безопасно сохраняет Excel-файл без падения скрипта, даже если старый отчёт открыт в Excel."""
+    try:
+        wb.save(export_path)
+    except PermissionError:
+        print(f"🔄 Файл {export_path.name} открыт в Excel — обновляем открытую книгу...")
+        close_workbook_in_excel_com(export_path)
+        try:
+            wb.save(export_path)
+        except PermissionError:
+            # Если в Excel активен курсор ввода внутри ячейки, сохраняем с меткой времени
+            ts = datetime.now().strftime("%H-%M-%S")
+            alt_path = export_path.with_name(f"{export_path.stem}_{ts}{export_path.suffix}")
+            wb.save(alt_path)
+            export_path = alt_path
+            print(f"⚠️ В Excel редактируется ячейка. Отчёт сохранён в новый файл: {export_path.name}")
+
+    if open_file and sys.platform == "win32":
+        try:
+            os.startfile(export_path)
+        except Exception as e:
+            print(f"⚠️ Файл сохранён ({export_path}), но не удалось открыть автоматически: {e}")
+    return export_path
+
+
+def build_Period_printers_stat(filtered_parsed, full_printers_stat):
+    """Пересчитывает выработку по принтерам строго за выбранный диапазон дат."""
+    p_stat = defaultdict(lambda: {
+        "tasks": 0, "copies": 0.0, "stopped_cnt": 0.0,
+        "weight": 0.0, "secs_good": 0.0, "secs_waste": 0.0,
+        "secs_after_sync": 0.0,
+    })
+    # Переносим актуальный прирост после сверки для корректного отображения общего одометра
+    for pname, full_st in full_printers_stat.items():
+        p_stat[pname]["secs_after_sync"] = full_st.get("secs_after_sync", 0.0)
+        p_stat[pname]["total_all_time_secs"] = full_st.get("secs_good", 0.0) + full_st.get("secs_waste", 0.0)
+
+    for x in filtered_parsed:
+        devs = [d.strip() for d in (x.get("printers") or "").split(",") if d.strip() and d.strip() != "—"]
+        if not devs:
+            continue
+        n = len(devs)
+        for dn in devs:
+            p_stat[dn]["tasks"] += 1
+            p_stat[dn]["copies"] += x["qty"] / n
+            p_stat[dn]["weight"] += x["tot_weight"] / n
+            p_stat[dn]["secs_good"] += x["tot_secs"] / n
+
+    return p_stat
+
+
+def generate_report(date_from=None, date_to=None, custom_filename=None, open_file=True):
+    res = parser.load_and_parse(quiet=bool(custom_filename))
     if not res or not res[0]:
-        return
-    parsed, printers_stat, devices_hw = res
+        return None
+    parsed_all, full_printers_stat, devices_hw = res
     odometers = config.load_odometers()
     cfg = config.load_config()
     to_interval = float(cfg.get("to_interval_hours") or 300)
+
+    is_period = bool(date_from or date_to)
+    d_min = date_from or "0000-00-00"
+    d_max = date_to or "9999-99-99"
+
+    parsed = [x for x in parsed_all if d_min <= x["date"] <= d_max]
+    if not parsed:
+        print(f"⚠️ За выбранный период ({d_min} ... {d_max}) завершённых задач не найдено.")
+        return None
+
+    printers_stat = build_Period_printers_stat(parsed, full_printers_stat) if is_period else full_printers_stat
+    period_label = f"за период {d_min} — {d_max}" if is_period else f"за все дни (обновлено {datetime.now():%H:%M:%S})"
 
     by_day = defaultdict(list)
     for x in parsed:
         by_day[x["date"]].append(x)
 
-    export_path = Path.home() / "Desktop" / f"farm_report_{datetime.now():%Y-%m-%d}.xlsx"
+    if custom_filename:
+        export_path = Path.home() / "Desktop" / custom_filename
+    elif is_period:
+        export_path = Path.home() / "Desktop" / f"farm_report_{d_min}_to_{d_max}.xlsx"
+    else:
+        export_path = Path.home() / "Desktop" / f"farm_report_{datetime.now():%Y-%m-%d}.xlsx"
+
     wb = Workbook()
     sh_df = wb.active
     sh_df.title = "По дням и файлам"
@@ -76,7 +200,8 @@ def generate_report():
     day_box = Border(top=med_bottom, bottom=med_bottom, left=thin, right=thin)
     sorted_days = sorted(by_day.keys(), reverse=True)
 
-    put(sh_df, "A1", "Разбивка выполненных задач по дням и файлам", bold=True, size=15)
+    # 1. ПО ДНЯМ И ФАЙЛАМ
+    put(sh_df, "A1", f"Разбивка выполненных задач по дням и файлам ({period_label})", bold=True, size=14)
     header(sh_df, 4, ["Дата", "Файл (задача)", "Запусков / Повторов", "Напечатано, шт",
                       "Вес 1 шт, г", "Всего пластик, г", "Время 1 шт", "Общее время печати"])
     rr = 5
@@ -132,7 +257,7 @@ def generate_report():
             rr += 1
 
     put(sh_df, f"A{rr}", "ВСЕГО", bold=True, fill=C_GREY, align="center")
-    put(sh_df, f"B{rr}", f"За все дни ({len(sorted_days)} дн.)", bold=True, fill=C_GREY)
+    put(sh_df, f"B{rr}", f"Итого ({len(sorted_days)} дн. | {period_label})", bold=True, fill=C_GREY)
     put(sh_df, f"C{rr}", grand_runs, bold=True, fill=C_GREY, align="center")
     put(sh_df, f"D{rr}", grand_qty, bold=True, fill=C_GREY, align="center")
     put(sh_df, f"E{rr}", "", fill=C_GREY)
@@ -145,7 +270,8 @@ def generate_report():
     sh_df.freeze_panes = "A5"
     widths(sh_df, [14, 42, 18, 16, 14, 18, 14, 18])
 
-    put(sh_dyn, "A1", "Сводная статистика по дням", bold=True, size=15)
+    # 2. ДИНАМИКА ПО ДНЯМ
+    put(sh_dyn, "A1", f"Сводная статистика по дням ({period_label})", bold=True, size=14)
     header(sh_dyn, 3, ["Дата", "Запусков тасок", "Напечатано, шт", "Уник. файлов", "Пластик, г", "Пластик, кг", "Общее время печати"])
     first_dyn = 4
     for i, d in enumerate(sorted_days):
@@ -178,7 +304,8 @@ def generate_report():
     sh_dyn.freeze_panes = "A4"
     widths(sh_dyn, [14, 16, 16, 15, 15, 14, 18])
 
-    put(sh_all, "A1", f"Журнал задач и повторов ({len(parsed)} шт.)", bold=True, size=15)
+    # 3. ВСЕ ЗАДАЧИ
+    put(sh_all, "A1", f"Журнал задач и повторов ({len(parsed)} шт. | {period_label})", bold=True, size=14)
     header(sh_all, 3, ["Дата", "Время", "Статус", "Файл (задача)", "Принтеры в пуле",
                        "Напечатано, шт", "План. время (1 шт)", "Вес 1 шт, г", "Всего пластик, г"])
     for i, t in enumerate(parsed):
@@ -199,11 +326,13 @@ def generate_report():
     sh_all.freeze_panes = "A4"
     widths(sh_all, [14, 9, 22, 42, 28, 15, 16, 14, 16])
 
-    put(sh_pr, "A1", "Сверка моточасов (Одометр экрана + Прирост), выработка и ТО", bold=True, size=15)
+    # 4. ПРИНТЕРЫ И МОТОЧАСЫ
+    put(sh_pr, "A1", f"Сверка моточасов, выработка ({period_label}) и статус ТО", bold=True, size=14)
     header(sh_pr, 4, [
         "Принтер", "Модель", "Сопло", "IP / Wi-Fi",
         "Готовых, шт", "Пластик, кг",
-        "По логам фермы, ч", "База с экрана, ч", "Дата сверки",
+        "Часы за период, ч" if is_period else "По логам фермы, ч",
+        "База с экрана, ч", "Дата сверки",
         "Прирост после сверки, ч", "АКТУАЛЬНО ОДОМЕТР, ч",
         "Сверка (Экран−Лог), ч", "Статус ТО / HMS"
     ])
@@ -213,12 +342,14 @@ def generate_report():
         hw = devices_hw.get(pname, {})
         odo = odometers.get(pname, {})
 
-        log_total_h = (pstat["secs_good"] + pstat["secs_waste"]) / 3600.0
+        period_h = (pstat["secs_good"] + pstat["secs_waste"]) / 3600.0
+        all_time_log_h = pstat.get("total_all_time_secs", pstat["secs_good"] + pstat["secs_waste"]) / 3600.0
+
         has_odo = "base_hours" in odo
         base_h = float(odo["base_hours"]) if has_odo else None
         sync_str = odo.get("sync_time", "—") if has_odo else "Не сверялся"
         delta_h = (pstat["secs_after_sync"] / 3600.0) if has_odo else 0.0
-        actual_odo_h = (base_h + delta_h) if has_odo else log_total_h
+        actual_odo_h = (base_h + delta_h) if has_odo else all_time_log_h
         drift_h = odo.get("last_drift_hours")
         last_to_h = float(odo.get("last_to_hours") or 0.0)
         hours_since_to = actual_odo_h - last_to_h
@@ -241,7 +372,7 @@ def generate_report():
         put(sh_pr, f"D{r_idx}", ip_wifi, align="center")
         put(sh_pr, f"E{r_idx}", round(pstat["copies"], 1), fmt="0.0", align="center")
         put(sh_pr, f"F{r_idx}", round(pstat["weight"] / 1000.0, 2), fmt="0.00")
-        put(sh_pr, f"G{r_idx}", round(log_total_h, 1), fmt="0.0")
+        put(sh_pr, f"G{r_idx}", round(period_h, 1), fmt="0.0")
         put(sh_pr, f"H{r_idx}", round(base_h, 1) if has_odo else "—", fmt="0.0" if has_odo else None, align="center" if not has_odo else None)
         put(sh_pr, f"I{r_idx}", sync_str, align="center")
         put(sh_pr, f"J{r_idx}", round(delta_h, 1) if has_odo else "—", fmt="0.0" if has_odo else None, align="center" if not has_odo else None)
@@ -254,7 +385,7 @@ def generate_report():
 
     sh_pr.auto_filter.ref = f"A4:M{4 + len(printers_stat)}"
     sh_pr.freeze_panes = "A5"
-    widths(sh_pr, [15, 12, 18, 22, 14, 13, 17, 16, 17, 19, 21, 18, 22])
+    widths(sh_pr, [15, 12, 18, 22, 14, 13, 18, 16, 17, 19, 21, 18, 22])
 
     for sh in wb.worksheets:
         sh.page_setup.orientation = "landscape"
@@ -262,10 +393,62 @@ def generate_report():
         sh.page_setup.fitToWidth = 1
         sh.page_setup.fitToHeight = 0
 
-    wb.save(export_path)
-    print(f"\n✅ Excel-отчёт готов: {export_path}")
-    if sys.platform == "win32":
-        os.startfile(export_path)
+    final_path = safe_save_and_open(wb, export_path, open_file=open_file)
+    print(f"✅ Excel-отчёт готов ({period_label}): {final_path}")
+    return final_path
+
+
+def generate_period_report_interactive():
+    """Меню выбора дат вручную для формирования отчёта за конкретный период."""
+    res = parser.load_and_parse(quiet=True)
+    if not res or not res[0]:
+        print("❌ Нет данных для отчёта.")
+        return
+    all_dates = sorted({x["date"] for x in res[0] if x.get("date") and x["date"] != "Неизвестно"})
+    min_d = all_dates[0] if all_dates else datetime.now().strftime("%Y-%m-%d")
+    max_d = all_dates[-1] if all_dates else datetime.now().strftime("%Y-%m-%d")
+
+    print("\n" + "=" * 78)
+    print(" 📅 ВЫГРУЗКА ОТЧЁТА ЗА ВЫБРАННЫЙ ПЕРИОД")
+    print("=" * 78)
+    print(f" Доступные даты в базе: с {min_d} по {max_d}")
+    print(" Формат ввода любой: ДД.ММ.ГГГГ (10.11.2026), ДД.ММ (10.11) или ГГГГ-ММ-ДД")
+    print("-" * 78)
+    raw_from = input(f" Начальная дата [Enter = с начала ({min_d})]: ").strip()
+    raw_to = input(f" Конечная дата  [Enter = по сегодня ({max_d})]: ").strip()
+
+    d_from = parse_user_date(raw_from, min_d)
+    d_to = parse_user_date(raw_to, max_d)
+    if d_from > d_to:
+        d_from, d_to = d_to, d_from
+
+    print(f"\n⏳ Формируем отчёт за период: {d_from} — {d_to}...")
+    generate_report(date_from=d_from, date_to=d_to, open_file=True)
+
+
+def live_excel_monitor_loop():
+    """Режим живой таблицы Excel: автоматически обновляет открытый файл каждые N секунд."""
+    print("\n" + "=" * 78)
+    print(" 🔴 РЕЖИМ ЖИВОЙ ТАБЛИЦЫ EXCEL (REAL-TIME AUTO-UPDATE)")
+    print("=" * 78)
+    sec_str = input("Интервал автообновления в секундах [Enter = 30 сек]: ").strip()
+    interval = int(sec_str) if sec_str.isdigit() and int(sec_str) >= 10 else 30
+
+    live_filename = "farm_report_LIVE.xlsx"
+    print(f"\n🚀 Запущен живой мониторинг! Файл на Рабочем столе: {live_filename}")
+    print("   Таблица в Excel будет сама обновляться каждые", interval, "сек.")
+    print("   Для остановки нажми Ctrl+C в этом окне.\n")
+
+    try:
+        while True:
+            generate_report(custom_filename=live_filename, open_file=True)
+            for remaining in range(interval, 0, -1):
+                sys.stdout.write(f"\r⏳ Следующее обновление таблицы через {remaining:2d} сек... (Ctrl+C — стоп) ")
+                sys.stdout.flush()
+                time.sleep(1)
+            print()
+    except KeyboardInterrupt:
+        print("\n\n⏹️ Живое обновление остановлено. Возврат в меню.")
 
 
 def update_single_printer_odometer(pname, val_str, printers_stat, odometers):

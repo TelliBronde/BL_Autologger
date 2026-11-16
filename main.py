@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import time
+import traceback
 import urllib.request
 from datetime import datetime
 
@@ -34,7 +35,7 @@ def sync_modules_from_github():
     branch = "test" if cfg.get("channel") == "test" else "main"
     repo = cfg.get("github_repo", config.GITHUB_REPO)
     token = (cfg.get("github_token") or "").strip()
-    headers = {"User-Agent": "BambuFarmControl/2.2", "Cache-Control": "no-cache"}
+    headers = {"User-Agent": "BambuFarmControl/2.3", "Cache-Control": "no-cache"}
     if token:
         headers["Authorization"] = f"token {token}"
 
@@ -53,7 +54,7 @@ def sync_modules_from_github():
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=6.0) as resp:
                 code_text = resp.read().decode("utf-8-sig")
-            compile(code_text, m, "exec")  # Проверка синтаксиса перед записью
+            compile(code_text, m, "exec")
             (config.HERE / m).write_text(code_text, encoding="utf-8")
             updated += 1
             print(f"  ✅ Обновлён модуль: {m}")
@@ -96,62 +97,83 @@ def main_menu():
         else:
             status_str = "⚪ Выключена"
 
+        ch_badge = cfg.get("channel", "stable").upper()
         print("==========================================================================")
-        print(f"   BAMBU FARM CONTROL — v{config.VERSION} | Репо: {cfg.get('github_repo')}")
+        print(f"   BAMBU FARM CONTROL — v{config.VERSION} [{ch_badge}] | {cfg.get('github_repo')}")
         print("==========================================================================")
         print(f" Статус фермы: {status_str} | Одометров: {len(config.load_odometers())} шт.")
         print("--------------------------------------------------------------------------")
         print("  [1] 🚀 Запустить / Перезапустить Ферму + Автологгер")
-        print("  [2] 📊 Сформировать и открыть Excel-отчёт (выработка + Моточасы)")
-        print("  [3] 🔧 Сверка и ручной ввод моточасов с экрана принтера (Одометр + ТО)")
-        print("  [4] 🔄 Ручные повторы за прошлые дни")
-        print("  [5] 🌐 Обновить модули с GitHub / ⏪ Откатить из бэкапа")
+        print("  [2] 📊 Сформировать полный Excel-отчёт (безопасно поверх открытого)")
+        print("  [3] 📅 Отчёт за период (указать начальную и конечную дату вручную)")
+        print("  [4] 🔴 Живая таблица Excel (автообновление в реальном времени)")
+        print("  [5] 🔧 Сверка и ручной ввод моточасов с экрана принтера (Одометр + ТО)")
+        print("  [6] 🔄 Ручные повторы за прошлые дни")
+        print("  [7] 🌐 Обновить модули с GitHub / ⏪ Откатить / Переключить ветку")
         print("  [0] Выход")
         print("==========================================================================")
         choice = input("Выбери пункт меню: ").strip()
 
-        if choice == "1":
-            reload_disk_modules()
-            connector.start_farm_with_hook()
+        try:
+            if choice == "1":
+                reload_disk_modules()
+                connector.start_farm_with_hook()
+                input("\nНажми Enter, чтобы вернуться в меню...")
+            elif choice == "2":
+                reload_disk_modules()
+                report.generate_report()
+                input("\nНажми Enter, чтобы вернуться в меню...")
+            elif choice == "3":
+                reload_disk_modules()
+                report.generate_period_report_interactive()
+                input("\nНажми Enter, чтобы вернуться в меню...")
+            elif choice == "4":
+                reload_disk_modules()
+                report.live_excel_monitor_loop()
+                input("\nНажми Enter, чтобы вернуться в меню...")
+            elif choice == "5":
+                reload_disk_modules()
+                report.odometer_reconciliation_menu()
+            elif choice == "6":
+                items = config.load_manual_reprints()
+                for i, it in enumerate(items, 1):
+                    print(f"  {i}. {it['date']} | {it['printer']} | {it['file']} | {it['qty']} шт.")
+                sub = input("[1] Добавить  [2] Удалить  [Enter] Назад: ").strip()
+                if sub == "1":
+                    d = input(f"Дата (Enter={datetime.now():%Y-%m-%d}): ").strip() or f"{datetime.now():%Y-%m-%d}"
+                    pr = input("Принтер (109 AMS): ").strip()
+                    fl = input("Файл: ").strip()
+                    q = input("Штук: ").strip()
+                    if pr and fl and q.isdigit():
+                        items.append({"date": d, "printer": pr, "file": fl, "qty": int(q)})
+                        config.save_manual_reprints(items)
+                elif sub == "2":
+                    n = input("Номер строки: ").strip()
+                    if n.isdigit() and 1 <= int(n) <= len(items):
+                        items.pop(int(n) - 1)
+                        config.save_manual_reprints(items)
+            elif choice == "7":
+                print(f"\nТекущая ветка: [{ch_badge}]")
+                print("[1] 🔄 Обновить модули с GitHub  [2] ⏪ Откатить на бэкап  [3] 🔀 Сменить ветку (main/test)  [4] 🔑 Токен")
+                sub = input("> ").strip()
+                if sub == "1":
+                    sync_modules_from_github()
+                elif sub == "2":
+                    rollback_modules()
+                elif sub == "3":
+                    cfg["channel"] = "test" if cfg.get("channel") == "stable" else "stable"
+                    config.save_config(cfg)
+                    print(f"🔀 Ветка переключена на: {cfg['channel'].upper()}")
+                elif sub == "4":
+                    cfg["github_token"] = input("GitHub Token: ").strip()
+                    config.save_config(cfg)
+                input("\nНажми Enter...")
+            elif choice == "0":
+                break
+        except Exception as e:
+            print(f"\n⚠️ Перехвачена ошибка (программа продолжает работу): {e}")
+            traceback.print_exc(limit=3)
             input("\nНажми Enter, чтобы вернуться в меню...")
-        elif choice == "2":
-            reload_disk_modules()
-            report.generate_report()
-            input("\nНажми Enter, чтобы вернуться в меню...")
-        elif choice == "3":
-            reload_disk_modules()
-            report.odometer_reconciliation_menu()
-        elif choice == "4":
-            items = config.load_manual_reprints()
-            for i, it in enumerate(items, 1):
-                print(f"  {i}. {it['date']} | {it['printer']} | {it['file']} | {it['qty']} шт.")
-            sub = input("[1] Добавить  [2] Удалить  [Enter] Назад: ").strip()
-            if sub == "1":
-                d = input(f"Дата (Enter={datetime.now():%Y-%m-%d}): ").strip() or f"{datetime.now():%Y-%m-%d}"
-                pr = input("Принтер (109 AMS): ").strip()
-                fl = input("Файл: ").strip()
-                q = input("Штук: ").strip()
-                if pr and fl and q.isdigit():
-                    items.append({"date": d, "printer": pr, "file": fl, "qty": int(q)})
-                    config.save_manual_reprints(items)
-            elif sub == "2":
-                n = input("Номер строки: ").strip()
-                if n.isdigit() and 1 <= int(n) <= len(items):
-                    items.pop(int(n) - 1)
-                    config.save_manual_reprints(items)
-        elif choice == "5":
-            print("\n[1] 🔄 Обновить модули с GitHub  [2] ⏪ Откатить на прошлый бэкап  [3] 🔑 Ввести GitHub Token")
-            sub = input("> ").strip()
-            if sub == "1":
-                sync_modules_from_github()
-            elif sub == "2":
-                rollback_modules()
-            elif sub == "3":
-                cfg["github_token"] = input("GitHub Token: ").strip()
-                config.save_config(cfg)
-            input("\nНажми Enter...")
-        elif choice == "0":
-            break
 
 
 if __name__ == "__main__":

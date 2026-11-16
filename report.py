@@ -2,6 +2,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -23,6 +25,21 @@ C_REP  = "FFF2CC"
 C_WORK = "DDEBF7"
 C_WARN = "FCE4D6"
 C_GREY = "F2F2F2"
+
+
+# Храним состояние фонового потока в sys, чтобы оно не сбрасывалось при перезагрузке модулей
+if not hasattr(sys, "_bambu_live_state"):
+    sys._bambu_live_state = {
+        "active": False,
+        "interval": 30,
+        "last_update": "—",
+        "file": "farm_report_LIVE.xlsx",
+        "status_msg": "",
+    }
+
+
+def get_live_state():
+    return sys._bambu_live_state
 
 
 def put(ws, ref, v, bold=False, fmt=None, fill=None, color=None, align=None, size=10, wrap=False):
@@ -57,15 +74,12 @@ def parse_user_date(raw_str: str, default_date: str) -> str:
     s = (raw_str or "").strip()
     if not s:
         return default_date
-    # ГГГГ-ММ-ДД
     if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
         return s
-    # ДД.ММ.ГГГГ или ДД/ММ/ГГГГ
     m_full = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$", s)
     if m_full:
         d, m, y = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
         return f"{y:04d}-{m:02d}-{d:02d}"
-    # Короткий формат ДД.ММ (год берём текущий)
     m_short = re.match(r"^(\d{1,2})[./-](\d{1,2})$", s)
     if m_short:
         d, m = int(m_short.group(1)), int(m_short.group(2))
@@ -74,69 +88,120 @@ def parse_user_date(raw_str: str, default_date: str) -> str:
     return default_date
 
 
-def close_workbook_in_excel_com(file_path: Path) -> bool:
-    """Если файл открыт в Excel, мягко закрывает только эту книгу через COM, чтобы снять блокировку записи."""
+def refresh_open_excel_via_vbs(temp_path: Path, target_path: Path) -> bool:
+    """
+    Обновляет открытую книгу Excel на лету через нативный VBScript COM:
+    запоминает текущую вкладку и ячейку, подменяет файл и открывает тот же лист.
+    """
     if sys.platform != "win32":
         return False
-    fname = file_path.name.replace("'", "''")
-    ps_script = (
-        "$ErrorActionPreference='SilentlyContinue'; "
-        "$xl=[Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application'); "
-        "if($xl){ "
-        "  $xl.DisplayAlerts=$false; "
-        f"  foreach($wb in $xl.Workbooks){{ if($wb.Name -eq '{fname}'){{ $wb.Close($false); $xl.DisplayAlerts=$true; exit 0 }} }} "
-        "  $xl.DisplayAlerts=$true; "
-        "} exit 1"
-    )
+
+    vbs_code = f'''
+On Error Resume Next
+Dim xl, wb, targetName, tempPath, targetPath, activeSheetName, activeCellAddr, found
+targetName = "{target_path.name}"
+tempPath = "{str(temp_path)}"
+targetPath = "{str(target_path)}"
+found = False
+activeSheetName = ""
+activeCellAddr = "A1"
+
+Set xl = GetObject(, "Excel.Application")
+If Err.Number = 0 And Not (xl Is Nothing) Then
+    For Each wb In xl.Workbooks
+        If LCase(wb.Name) = LCase(targetName) Then
+            found = True
+            activeSheetName = wb.ActiveSheet.Name
+            activeCellAddr = xl.Selection.Address
+            xl.DisplayAlerts = False
+            wb.Close False
+            If Err.Number <> 0 Then WScript.Quit 2
+            Exit For
+        End If
+    Next
+End If
+Err.Clear
+
+Dim fso
+Set fso = CreateObject("Scripting.FileSystemObject")
+If fso.FileExists(targetPath) Then fso.DeleteFile targetPath, True
+If Err.Number <> 0 Then WScript.Quit 3
+fso.MoveFile tempPath, targetPath
+If Err.Number <> 0 Then WScript.Quit 4
+
+If found And Not (xl Is Nothing) Then
+    Dim newWb
+    Set newWb = xl.Workbooks.Open(targetPath)
+    If activeSheetName <> "" Then
+        newWb.Worksheets(activeSheetName).Activate
+        xl.Range(activeCellAddr).Select
+    End If
+    xl.DisplayAlerts = True
+End If
+WScript.Quit 0
+'''
+    vbs_file = Path(tempfile.gettempdir()) / "bambu_excel_refresh.vbs"
     try:
+        vbs_file.write_text(vbs_code, encoding="cp1251", errors="ignore")
         res = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_script],
+            ["cscript", "//NoLogo", str(vbs_file)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=4,
+            timeout=6,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        if res.returncode == 0:
-            time.sleep(0.3)
-            return True
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def safe_save_and_open(wb: Workbook, export_path: Path, open_file=True, is_live_tick=False) -> Path:
+    """Сохраняет и бесшовно обновляет Excel-файл даже если он прямо сейчас открыт на экране."""
+    temp_path = export_path.with_suffix(".tmp.xlsx")
+    wb.save(temp_path)
+
+    # 1. Пробуем обычную замену (сработает мгновенно, если файл НЕ открыт в Excel)
+    try:
+        if export_path.exists():
+            os.replace(temp_path, export_path)
+        else:
+            temp_path.rename(export_path)
+        if open_file and sys.platform == "win32":
+            os.startfile(export_path)
+        return export_path
+    except PermissionError:
+        pass
+
+    # 2. Если файл открыт в Excel — бесшовно перезагружаем его через VBScript COM с сохранением вкладки
+    if refresh_open_excel_via_vbs(temp_path, export_path):
+        return export_path
+
+    # 3. Если пользователь прямо сейчас печатает текст внутри ячейки (мигает курсор ввода)
+    try:
+        if temp_path.exists():
+            temp_path.unlink()
     except Exception:
         pass
-    return False
 
+    if is_live_tick:
+        # В фоновом режиме не плодим копии файлов на Рабочем столе, просто обновим на следующем такте
+        sys._bambu_live_state["status_msg"] = "Ожидание (нажми Enter/Esc в ячейке Excel)"
+        return export_path
 
-def safe_save_and_open(wb: Workbook, export_path: Path, open_file=True) -> Path:
-    """Безопасно сохраняет Excel-файл без падения скрипта, даже если старый отчёт открыт в Excel."""
-    try:
-        wb.save(export_path)
-    except PermissionError:
-        print(f"🔄 Файл {export_path.name} открыт в Excel — обновляем открытую книгу...")
-        close_workbook_in_excel_com(export_path)
-        try:
-            wb.save(export_path)
-        except PermissionError:
-            # Если в Excel активен курсор ввода внутри ячейки, сохраняем с меткой времени
-            ts = datetime.now().strftime("%H-%M-%S")
-            alt_path = export_path.with_name(f"{export_path.stem}_{ts}{export_path.suffix}")
-            wb.save(alt_path)
-            export_path = alt_path
-            print(f"⚠️ В Excel редактируется ячейка. Отчёт сохранён в новый файл: {export_path.name}")
-
+    ts = datetime.now().strftime("%H-%M-%S")
+    alt_path = export_path.with_name(f"{export_path.stem}_{ts}{export_path.suffix}")
+    wb.save(alt_path)
     if open_file and sys.platform == "win32":
-        try:
-            os.startfile(export_path)
-        except Exception as e:
-            print(f"⚠️ Файл сохранён ({export_path}), но не удалось открыть автоматически: {e}")
-    return export_path
+        os.startfile(alt_path)
+    return alt_path
 
 
-def build_Period_printers_stat(filtered_parsed, full_printers_stat):
-    """Пересчитывает выработку по принтерам строго за выбранный диапазон дат."""
+def build_period_printers_stat(filtered_parsed, full_printers_stat):
     p_stat = defaultdict(lambda: {
         "tasks": 0, "copies": 0.0, "stopped_cnt": 0.0,
         "weight": 0.0, "secs_good": 0.0, "secs_waste": 0.0,
         "secs_after_sync": 0.0,
     })
-    # Переносим актуальный прирост после сверки для корректного отображения общего одометра
     for pname, full_st in full_printers_stat.items():
         p_stat[pname]["secs_after_sync"] = full_st.get("secs_after_sync", 0.0)
         p_stat[pname]["total_all_time_secs"] = full_st.get("secs_good", 0.0) + full_st.get("secs_waste", 0.0)
@@ -155,8 +220,8 @@ def build_Period_printers_stat(filtered_parsed, full_printers_stat):
     return p_stat
 
 
-def generate_report(date_from=None, date_to=None, custom_filename=None, open_file=True):
-    res = parser.load_and_parse(quiet=bool(custom_filename))
+def generate_report(date_from=None, date_to=None, custom_filename=None, open_file=True, is_live_tick=False, quiet=False):
+    res = parser.load_and_parse(quiet=(quiet or is_live_tick))
     if not res or not res[0]:
         return None
     parsed_all, full_printers_stat, devices_hw = res
@@ -170,11 +235,12 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
 
     parsed = [x for x in parsed_all if d_min <= x["date"] <= d_max]
     if not parsed:
-        print(f"⚠️ За выбранный период ({d_min} ... {d_max}) завершённых задач не найдено.")
+        if not quiet:
+            print(f"⚠️ За выбранный период ({d_min} ... {d_max}) завершённых задач не найдено.")
         return None
 
-    printers_stat = build_Period_printers_stat(parsed, full_printers_stat) if is_period else full_printers_stat
-    period_label = f"за период {d_min} — {d_max}" if is_period else f"за все дни (обновлено {datetime.now():%H:%M:%S})"
+    printers_stat = build_period_printers_stat(parsed, full_printers_stat) if is_period else full_printers_stat
+    period_label = f"за период {d_min} — {d_max}" if is_period else f"обновлено в {datetime.now():%H:%M:%S}"
 
     by_day = defaultdict(list)
     for x in parsed:
@@ -393,13 +459,13 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
         sh.page_setup.fitToWidth = 1
         sh.page_setup.fitToHeight = 0
 
-    final_path = safe_save_and_open(wb, export_path, open_file=open_file)
-    print(f"✅ Excel-отчёт готов ({period_label}): {final_path}")
+    final_path = safe_save_and_open(wb, export_path, open_file=open_file, is_live_tick=is_live_tick)
+    if not quiet and not is_live_tick:
+        print(f"✅ Excel-отчёт готов ({period_label}): {final_path}")
     return final_path
 
 
 def generate_period_report_interactive():
-    """Меню выбора дат вручную для формирования отчёта за конкретный период."""
     res = parser.load_and_parse(quiet=True)
     if not res or not res[0]:
         print("❌ Нет данных для отчёта.")
@@ -426,29 +492,56 @@ def generate_period_report_interactive():
     generate_report(date_from=d_from, date_to=d_to, open_file=True)
 
 
-def live_excel_monitor_loop():
-    """Режим живой таблицы Excel: автоматически обновляет открытый файл каждые N секунд."""
+def _background_live_worker():
+    state = sys._bambu_live_state
+    while state["active"]:
+        for _ in range(state["interval"]):
+            if not state["active"]:
+                return
+            time.sleep(1)
+        if not state["active"]:
+            return
+        try:
+            generate_report(
+                custom_filename=state["file"],
+                open_file=False,
+                is_live_tick=True,
+                quiet=True,
+            )
+            state["last_update"] = datetime.now().strftime("%H:%M:%S")
+            state["status_msg"] = "ОК"
+        except Exception as e:
+            state["status_msg"] = f"Ошибка: {e}"
+
+
+def toggle_live_excel_background():
+    """Включает или выключает фоновую запись и автообновление таблицы farm_report_LIVE.xlsx."""
+    state = sys._bambu_live_state
+    if state["active"]:
+        state["active"] = False
+        print("\n⏹️ Фоновое Live-обновление Excel ОСТАНОВЛЕНО.")
+        time.sleep(0.8)
+        return
+
     print("\n" + "=" * 78)
-    print(" 🔴 РЕЖИМ ЖИВОЙ ТАБЛИЦЫ EXCEL (REAL-TIME AUTO-UPDATE)")
+    print(" 🔴 ЗАПУСК ФОНОВОЙ LIVE-ЗАПИСИ В EXCEL")
     print("=" * 78)
-    sec_str = input("Интервал автообновления в секундах [Enter = 30 сек]: ").strip()
+    sec_str = input("Интервал фонового обновления в секундах [Enter = 30 сек]: ").strip()
     interval = int(sec_str) if sec_str.isdigit() and int(sec_str) >= 10 else 30
 
-    live_filename = "farm_report_LIVE.xlsx"
-    print(f"\n🚀 Запущен живой мониторинг! Файл на Рабочем столе: {live_filename}")
-    print("   Таблица в Excel будет сама обновляться каждые", interval, "сек.")
-    print("   Для остановки нажми Ctrl+C в этом окне.\n")
+    state["interval"] = interval
+    state["active"] = True
+    state["status_msg"] = "Запуск..."
 
-    try:
-        while True:
-            generate_report(custom_filename=live_filename, open_file=True)
-            for remaining in range(interval, 0, -1):
-                sys.stdout.write(f"\r⏳ Следующее обновление таблицы через {remaining:2d} сек... (Ctrl+C — стоп) ")
-                sys.stdout.flush()
-                time.sleep(1)
-            print()
-    except KeyboardInterrupt:
-        print("\n\n⏹️ Живое обновление остановлено. Возврат в меню.")
+    print(f"⏳ Создаём и открываем живую таблицу {state['file']}...")
+    generate_report(custom_filename=state["file"], open_file=True, is_live_tick=False, quiet=True)
+    state["last_update"] = datetime.now().strftime("%H:%M:%S")
+    state["status_msg"] = "ОК"
+
+    t = threading.Thread(target=_background_live_worker, daemon=True)
+    t.start()
+    print(f"✅ Фоновая Live-запись запущена! Таблица {state['file']} теперь сама обновляется каждые {interval} сек.")
+    time.sleep(1.5)
 
 
 def update_single_printer_odometer(pname, val_str, printers_stat, odometers):

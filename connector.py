@@ -7,12 +7,16 @@ from pathlib import Path
 import websocket
 import config
 
+# JS-радар v6 с защитой от переполнения localStorage (ротация старых записей)
 JS_HOOK = r"""
 (() => {
   window.__tasksMap = JSON.parse(localStorage.getItem('__bambu_tasks_v2') || '{}');
   window.__reprintsList = JSON.parse(localStorage.getItem('__bambu_reprints_v2') || '[]');
   window.__devicesInfo = JSON.parse(localStorage.getItem('__bambu_devices_v2') || '{}');
   window.__pState = window.__pState || {};
+
+  const MAX_TASKS = 2000;
+  const MAX_REPRINTS = 1500;
 
   const compactTask = (t) => ({
     id: t.id,
@@ -34,12 +38,30 @@ JS_HOOK = r"""
     } : {}
   });
 
+  const trimStorage = () => {
+    if (window.__reprintsList.length > MAX_REPRINTS) {
+      window.__reprintsList = window.__reprintsList.slice(-MAX_REPRINTS);
+    }
+    const keys = Object.keys(window.__tasksMap);
+    if (keys.length > MAX_TASKS) {
+      keys.sort((a, b) => Number(a) - Number(b));
+      const toRemove = keys.slice(0, keys.length - MAX_TASKS);
+      toRemove.forEach(k => delete window.__tasksMap[k]);
+    }
+  };
+
   const saveAll = () => {
     try {
+      trimStorage();
       localStorage.setItem('__bambu_tasks_v2', JSON.stringify(window.__tasksMap));
       localStorage.setItem('__bambu_reprints_v2', JSON.stringify(window.__reprintsList));
       localStorage.setItem('__bambu_devices_v2', JSON.stringify(window.__devicesInfo));
-    } catch (e) {}
+    } catch (e) {
+      try {
+        window.__reprintsList = window.__reprintsList.slice(-500);
+        localStorage.setItem('__bambu_reprints_v2', JSON.stringify(window.__reprintsList));
+      } catch (_) {}
+    }
     if (window.__updateBambuUI) window.__updateBambuUI();
   };
 
@@ -158,8 +180,8 @@ JS_HOOK = r"""
     } catch (e) {}
   };
 
-  if (!window.__bambuHookedV5) {
-    window.__bambuHookedV5 = true;
+  if (!window.__bambuHookedV6) {
+    window.__bambuHookedV6 = true;
     const oOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (m, u) {
       this.__u = String(u);
@@ -221,7 +243,6 @@ JS_HOOK = r"""
 
 
 def is_farm_process_running() -> bool:
-    """Проверяет через системный tasklist, реально ли запущен Bambu Farm Manager Client.exe."""
     try:
         out = subprocess.check_output(
             ["tasklist", "/FI", f"IMAGENAME eq {config.FARM_EXE_NAME}", "/NH"],
@@ -234,7 +255,6 @@ def is_farm_process_running() -> bool:
 
 
 def kill_farm_processes():
-    """Принудительно закрывает зависшие фоновые процессы фермы."""
     subprocess.run(
         ["taskkill", "/F", "/IM", config.FARM_EXE_NAME, "/T"],
         stdout=subprocess.DEVNULL,
@@ -243,8 +263,56 @@ def kill_farm_processes():
     time.sleep(1.0)
 
 
+def check_port_network_exposure() -> str:
+    """Проверяет, не слушает ли порт отладки внешние сетевые интерфейсы (0.0.0.0 или LAN IP)."""
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano", "-p", "TCP"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            stderr=subprocess.DEVNULL,
+        ).decode("ascii", errors="ignore")
+        for line in out.splitlines():
+            if "LISTENING" not in line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            local_addr = parts[1]
+            for port in config.CDP_SCAN_PORTS:
+                if local_addr.endswith(f":{port}"):
+                    ip_part = local_addr.rsplit(":", 1)[0]
+                    if ip_part not in ("127.0.0.1", "[::1]"):
+                        return f"🛑 ВНИМАНИЕ: Порт {port} открыт в сеть ({local_addr})!"
+    except Exception:
+        pass
+    return ""
+
+
+def _is_valid_farm_target(port: int, target: dict) -> bool:
+    """Проверяет, что на порту именно Electron-клиент Bambu Farm Manager, а не браузер Chrome/Edge."""
+    t_type = target.get("type", "")
+    t_url = (target.get("url") or "").lower()
+    t_title = (target.get("title") or "").lower()
+
+    if t_type != "page" or "devtools://" in t_url or "webSocketDebuggerUrl" not in target:
+        return False
+
+    # Проверка User-Agent браузерного движка через /json/version
+    is_electron = False
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=0.8) as resp:
+            ver_info = json.loads(resp.read().decode("utf-8"))
+            ua = (ver_info.get("User-Agent") or "").lower()
+            if "electron" in ua:
+                is_electron = True
+    except Exception:
+        pass
+
+    has_marker = any(m in t_title or m in t_url for m in config.FARM_MARKERS)
+    return is_electron or has_marker
+
+
 def get_cdp_ws_url():
-    """Возвращает WebSocket URL только если сам процесс фермы реально запущен."""
     if not is_farm_process_running():
         return None
 
@@ -253,9 +321,7 @@ def get_cdp_ws_url():
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=1.0) as resp:
                 targets = json.loads(resp.read().decode("utf-8"))
             for t in targets:
-                t_type = t.get("type")
-                t_url = t.get("url", "")
-                if t_type == "page" and "devtools://" not in t_url and "webSocketDebuggerUrl" in t:
+                if _is_valid_farm_target(port, t):
                     return t["webSocketDebuggerUrl"]
         except Exception:
             pass
@@ -267,6 +333,7 @@ def cdp_eval(expression, timeout=5.0, bring_to_front=False):
     if not ws_url:
         return None
     try:
+        # suppress_origin=True позволяет подключаться без опасного флага --remote-allow-origins=*
         ws = websocket.create_connection(ws_url, timeout=timeout, suppress_origin=True)
         if bring_to_front:
             ws.send(json.dumps({"id": 0, "method": "Page.bringToFront"}))
@@ -282,27 +349,30 @@ def cdp_eval(expression, timeout=5.0, bring_to_front=False):
 
 
 def pull_live_data_from_farm():
-    if not get_cdp_ws_url():
+    with config.get_lock():
+        if not get_cdp_ws_url():
+            return None
+        cdp_eval(JS_HOOK)
+        expr = (
+            "JSON.stringify(["
+            "{total: Object.keys(window.__tasksMap||{}).length, hits: Object.values(window.__tasksMap||{})},"
+            "{__reprints_list__: window.__reprintsList||[]},"
+            "{__devices_info__: window.__devicesInfo||{}}"
+            "])"
+        )
+        raw_json = cdp_eval(expr, timeout=10.0)
+        if raw_json:
+            try:
+                data = json.loads(raw_json)
+                if isinstance(data, list) and len(data) > 0:
+                    if len(data[0].get("hits", [])) > 0 or len(data[2].get("__devices_info__", {})) > 0:
+                        tmp = config.LIVE_DUMP_FILE.with_suffix(".tmp.json")
+                        tmp.write_text(raw_json, encoding="utf-8")
+                        tmp.replace(config.LIVE_DUMP_FILE)
+                        return config.LIVE_DUMP_FILE
+            except Exception:
+                pass
         return None
-    cdp_eval(JS_HOOK)
-    expr = (
-        "JSON.stringify(["
-        "{total: Object.keys(window.__tasksMap||{}).length, hits: Object.values(window.__tasksMap||{})},"
-        "{__reprints_list__: window.__reprintsList||[]},"
-        "{__devices_info__: window.__devicesInfo||{}}"
-        "])"
-    )
-    raw_json = cdp_eval(expr, timeout=10.0)
-    if raw_json:
-        try:
-            data = json.loads(raw_json)
-            if isinstance(data, list) and len(data) > 0:
-                if len(data[0].get("hits", [])) > 0 or len(data[2].get("__devices_info__", {})) > 0:
-                    config.LIVE_DUMP_FILE.write_text(raw_json, encoding="utf-8")
-                    return config.LIVE_DUMP_FILE
-        except Exception:
-            pass
-    return None
 
 
 def start_farm_with_hook():
@@ -313,7 +383,7 @@ def start_farm_with_hook():
         print("ℹ️ Процесс фермы найден в системе. Разворачиваем окно и обновляем хук...")
         cnt = cdp_eval(JS_HOOK, bring_to_front=True)
         print(f"✅ Автологгер активен! (В памяти задач: {cnt})")
-        ans = input("Если окно фермы зависло в трее, перезапустить её с нуля? [R = Перезапустить / Enter = Оставить]: ").strip()
+        ans = input("Перезапустить ферму с нуля? [R = Перезапустить / Enter = Оставить]: ").strip()
         if ans.upper() != "R":
             return
         kill_farm_processes()
@@ -329,9 +399,9 @@ def start_farm_with_hook():
         print("❌ Файл клиента фермы не найден!")
         return
 
-    print(f"🚀 Запускаем {exe_path.name} на порту {config.CDP_PORT}...")
+    print(f"🚀 Запускаем {exe_path.name} на локальном порту 127.0.0.1:{config.CDP_PORT} (без --remote-allow-origins)...")
     subprocess.Popen(
-        [str(exe_path), f"--remote-debugging-port={config.CDP_PORT}", "--remote-allow-origins=*"],
+        [str(exe_path), f"--remote-debugging-port={config.CDP_PORT}"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -342,6 +412,9 @@ def start_farm_with_hook():
             time.sleep(1.5)
             cnt = cdp_eval(JS_HOOK, bring_to_front=True)
             if cnt is not None:
-                print(f"✅ Ферма открыта, автологгер подключён! (В памяти задач: {cnt})")
+                print(f"✅ Ферма открыта, автологгер безопасно подключён! (В памяти задач: {cnt})")
+                warn = check_port_network_exposure()
+                if warn:
+                    print(warn)
                 return
     print("❌ Не удалось дождаться ответа от окна фермы.")

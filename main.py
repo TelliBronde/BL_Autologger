@@ -1,3 +1,4 @@
+import getpass
 import importlib
 import importlib.util
 import os
@@ -15,7 +16,10 @@ import report
 
 
 def reload_disk_modules():
-    """Динамически подгружает свежие .py модули с диска (даже если запущен из .exe)."""
+    """Подгружает внешние .py модули с диска только если это разрешено в конфиге."""
+    cfg = config.load_config()
+    if getattr(sys, "frozen", False) and not cfg.get("allow_disk_override", True):
+        return
     for mod_file in ("config.py", "connector.py", "parser.py", "report.py"):
         mod_name = mod_file[:-3]
         disk_path = config.HERE / mod_file
@@ -30,6 +34,15 @@ def reload_disk_modules():
                 print(f"⚠️ Ошибка в модуле {mod_file}: {e}")
 
 
+def restart_self():
+    print("🔄 Перезапуск меню с обновлённым кодом...")
+    time.sleep(0.8)
+    if getattr(sys, "frozen", False):
+        os.execv(sys.executable, [sys.executable] + sys.argv[1:])
+    else:
+        os.execv(sys.executable, [sys.executable, str(config.HERE / "main.py")])
+
+
 def sync_modules_from_github(target_branch=None):
     cfg = config.load_config()
     if target_branch in ("main", "stable"):
@@ -41,10 +54,12 @@ def sync_modules_from_github(target_branch=None):
     else:
         branch = "test" if cfg.get("channel") == "test" else "main"
 
+    cfg["allow_disk_override"] = True
     config.save_config(cfg)
+
     repo = cfg.get("github_repo", config.GITHUB_REPO)
     token = (cfg.get("github_token") or "").strip()
-    headers = {"User-Agent": "BambuFarmControl/2.4", "Cache-Control": "no-cache"}
+    headers = {"User-Agent": "BambuFarmControl/2.5", "Cache-Control": "no-cache"}
     if token:
         headers["Authorization"] = f"token {token}"
 
@@ -72,9 +87,9 @@ def sync_modules_from_github(target_branch=None):
             print(f"  ⚠️ Пропущен {m}: {e}")
 
     if updated:
-        reload_disk_modules()
         print(f"\n🎉 Успешно обновлено модулей: {updated} из ветки [{branch.upper()}]!")
-        print(f"   Бэкап прошлой версии сохранён в: versions/{bak_dir.name}")
+        print(f"   Бэкап прошлой версии: versions/{bak_dir.name}")
+        restart_self()
     else:
         print("\n❌ Ни один модуль не обновлён. Проверь интернет или GitHub Token.")
 
@@ -92,13 +107,14 @@ def rollback_modules():
         chosen = backups[int(ch) - 1]
         for f in chosen.glob("*.py"):
             shutil.copy2(f, config.HERE / f.name)
-        reload_disk_modules()
         print(f"⏪ Все модули успешно восстановлены из {chosen.name}!")
+        restart_self()
 
 
 def main_menu():
+    cfg = config.load_config()
     disk_main = config.HERE / "main.py"
-    if getattr(sys, "frozen", False) and not globals().get("__DISK_MAIN_ACTIVE__") and disk_main.exists():
+    if getattr(sys, "frozen", False) and cfg.get("allow_disk_override", True) and not globals().get("__DISK_MAIN_ACTIVE__") and disk_main.exists():
         try:
             reload_disk_modules()
             code = disk_main.read_text(encoding="utf-8-sig")
@@ -108,24 +124,20 @@ def main_menu():
             exec(compile(code, str(disk_main), "exec"), g)
             return
         except Exception as e:
-            print(f"\n🚨 Сбой во внешнем main.py ({e})! Запускаем встроенное аварийное меню .exe...")
+            print(f"\n🚨 Сбой во внешнем main.py ({e})! Запускаем встроенное ядро .exe...")
             time.sleep(2)
 
     reload_disk_modules()
-
-    if "--stable" in sys.argv:
-        sync_modules_from_github("main")
-    elif "--test" in sys.argv:
-        sync_modules_from_github("test")
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
         cfg = config.load_config()
         proc_ok = connector.is_farm_process_running()
         cdp_ok = bool(connector.get_cdp_ws_url())
+        net_warn = connector.check_port_network_exposure() if hasattr(connector, "check_port_network_exposure") else ""
 
         if proc_ok and cdp_ok:
-            status_str = "🟢 ЗАПУЩЕНА И ПОДКЛЮЧЕНА"
+            status_str = "🟢 ЗАПУЩЕНА И ПОДКЛЮЧЕНА (127.0.0.1)"
         elif proc_ok and not cdp_ok:
             status_str = "🟡 Запущена БЕЗ порта автологгера (нажми [1] для перезапуска)"
         else:
@@ -134,8 +146,8 @@ def main_menu():
         is_test = cfg.get("channel") == "test"
         branch_badge = "🧪 ВЕТКА: TEST (test)" if is_test else "🟢 ВЕТКА: STABLE (main)"
 
-        live_st = report.get_live_state()
-        if live_st["active"]:
+        live_st = report.get_live_state() if hasattr(report, "get_live_state") else {"active": False}
+        if live_st.get("active"):
             live_header = f"🔴 LIVE-ЗАПИСЬ: ВКЛ (каждые {live_st['interval']}с | обновл. в {live_st['last_update']} | {live_st['file']})"
             btn4_text = "⏹️ Остановить фоновую Live-запись Excel"
         else:
@@ -147,6 +159,8 @@ def main_menu():
         print("==========================================================================")
         print(f" Статус фермы:  {status_str} | Одометров: {len(config.load_odometers())} шт.")
         print(f" Живая таблица: {live_header}")
+        if net_warn:
+            print(f" {net_warn}")
         print("--------------------------------------------------------------------------")
         print("  [1] 🚀 Запустить / Перезапустить Ферму + Автологгер")
         print("  [2] 📊 Сформировать полный Excel-отчёт (безопасно поверх открытого)")
@@ -180,15 +194,18 @@ def main_menu():
                 report.odometer_reconciliation_menu()
             elif choice == "6":
                 items = config.load_manual_reprints()
+                if not items:
+                    print("  (Список ручных повторов пуст)")
                 for i, it in enumerate(items, 1):
                     print(f"  {i}. {it['date']} | {it['printer']} | {it['file']} | {it['qty']} шт.")
                 sub = input("[1] Добавить  [2] Удалить  [Enter] Назад: ").strip()
                 if sub == "1":
-                    d = input(f"Дата (Enter={datetime.now():%Y-%m-%d}): ").strip() or f"{datetime.now():%Y-%m-%d}"
-                    pr = input("Принтер (109 AMS): ").strip()
-                    fl = input("Файл: ").strip()
+                    d_raw = input(f"Дата (Enter={datetime.now():%Y-%m-%d}): ").strip()
+                    d = report.parse_user_date(d_raw, f"{datetime.now():%Y-%m-%d}")
+                    pr = parser.clean_str(input("Принтер (109 AMS): "))
+                    fl = parser.clean_str(input("Файл: "))
                     q = input("Штук: ").strip()
-                    if pr and fl and q.isdigit():
+                    if pr and fl and q.isdigit() and int(q) > 0:
                         items.append({"date": d, "printer": pr, "file": fl, "qty": int(q)})
                         config.save_manual_reprints(items)
                 elif sub == "2":
@@ -197,11 +214,13 @@ def main_menu():
                         items.pop(int(n) - 1)
                         config.save_manual_reprints(items)
             elif choice == "7":
-                print("\n--- 🌐 ВЫБОР ВЕТКИ ОБНОВЛЕНИЯ GITHUB ---")
+                override_st = "ВКЛ" if cfg.get("allow_disk_override", True) else "ВЫКЛ (только ядро .exe)"
+                print("\n--- 🌐 ВЫБОР ВЕТКИ И БЕЗОПАСНОСТЬ ---")
                 print("  [1] 🟢 Обновить из STABLE ветки (main)")
                 print("  [2] 🧪 Обновить из TEST ветки (test)")
                 print("  [3] ⏪ Откатить модули на предыдущий бэкап")
-                print("  [4] 🔑 Указать GitHub Token (для приватного репозитория)")
+                print("  [4] 🔑 Указать Fine-grained GitHub Token (Read-Only)")
+                print(f"  [5] 🔒 Подгрузка внешних .py файлов в .exe: [{override_st}]")
                 sub = input("> ").strip()
                 if sub == "1":
                     sync_modules_from_github("main")
@@ -210,12 +229,18 @@ def main_menu():
                 elif sub == "3":
                     rollback_modules()
                 elif sub == "4":
-                    cfg["github_token"] = input("GitHub Token: ").strip()
+                    tok = getpass.getpass("Вставь GitHub Token (ввод скрыт): ").strip() or input("Token: ").strip()
+                    cfg["github_token"] = tok
                     config.save_config(cfg)
                     print("✅ Токен сохранён!")
+                elif sub == "5":
+                    cfg["allow_disk_override"] = not cfg.get("allow_disk_override", True)
+                    config.save_config(cfg)
+                    print(f"✅ Подгрузка внешних .py переключена: {'ВКЛ' if cfg['allow_disk_override'] else 'ВЫКЛ'}")
                 input("\nНажми Enter...")
             elif choice == "0":
-                report.get_live_state()["active"] = False
+                if hasattr(report, "get_live_state"):
+                    report.get_live_state()["active"] = False
                 break
         except Exception as e:
             print(f"\n⚠️ Перехвачена ошибка (программа продолжает работу): {e}")

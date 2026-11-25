@@ -1,9 +1,10 @@
 import json
+import re
 import sys
 import threading
 from pathlib import Path
 
-VERSION = "2.5.0-sec"
+VERSION = "3.0.0-live"
 GITHUB_REPO = "TelliBronde/BL_Autologger"
 MODULES = ["config.py", "connector.py", "parser.py", "report.py", "main.py"]
 
@@ -18,9 +19,10 @@ VERSIONS_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = HERE / "farm_config.json"
 ODOMETER_FILE = HERE / "odometer_base.json"
 MANUAL_FILE = HERE / "manual_reprints.json"
+ORDERS_MAP_FILE = HERE / "orders_map.json"
+ARCHIVE_FILE = HERE / "farm_archive.json"
 LIVE_DUMP_FILE = HERE / "history_live.json"
 
-# Строгий список папок и лимит размера файла (200 МБ)
 SEARCH_DIRS = [HERE, Path.home() / "Downloads", Path.home() / "Desktop"]
 MAX_JSON_BYTES = 200 * 1024 * 1024
 
@@ -30,14 +32,20 @@ FARM_EXE = Path(rf"C:\Program Files\Bambu Farm Manager Client\{FARM_EXE_NAME}")
 CDP_PORT = 19222
 CDP_SCAN_PORTS = (19222, 9222)
 FARM_MARKERS = ("bambu", "farm", "app.asar")
+SUCCESS_THRESHOLD_PCT = 95
 
-# Единая межпоточная блокировка (защита от гонки потоков в режиме Live Excel)
 if not hasattr(sys, "_bambu_rlock"):
     sys._bambu_rlock = threading.RLock()
 
 
 def get_lock() -> threading.RLock:
     return sys._bambu_rlock
+
+
+def sanitize_filename_tag(name: str) -> str:
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", (name or "").strip())
+    s = re.sub(r"\s+", "_", s).strip("._")
+    return s or "Farm"
 
 
 def load_json(path: Path, default):
@@ -60,16 +68,18 @@ def save_json(path: Path, data):
 
 def load_config():
     default_cfg = {
+        "setup_done": False,
+        "location_name": "",
+        "start_date": "2026-12-01",
+        "live_interval_sec": 60,
         "channel": "stable",
         "github_repo": GITHUB_REPO,
         "github_token": "",
-        "allow_disk_override": True,  # Можно отключить на цеховых ПК, чтобы .exe работал строго изнутри
+        "allow_disk_override": True,
         "to_interval_hours": 300,
     }
     cfg = load_json(CONFIG_FILE, {})
     default_cfg.update(cfg)
-    if not CONFIG_FILE.exists():
-        save_json(CONFIG_FILE, default_cfg)
     return default_cfg
 
 
@@ -85,8 +95,35 @@ def save_odometers(data):
     save_json(ODOMETER_FILE, data)
 
 
+def load_orders_map():
+    """
+    Правила автогруппировки файлов в заказы:
+    [{"pattern": "CHYK_4.5.0*", "order": "CHYK 4.5.0", "parts_per_plate": 1}]
+    """
+    if not ORDERS_MAP_FILE.exists():
+        return []
+    raw = load_json(ORDERS_MAP_FILE, [])
+    valid = []
+    if isinstance(raw, list):
+        for it in raw:
+            if isinstance(it, dict) and it.get("pattern") and it.get("order"):
+                try:
+                    ppp = max(1, int(it.get("parts_per_plate", 1)))
+                except Exception:
+                    ppp = 1
+                valid.append({
+                    "pattern": str(it["pattern"]).strip(),
+                    "order": str(it["order"]).strip(),
+                    "parts_per_plate": ppp,
+                })
+    return valid
+
+
+def save_orders_map(rules):
+    save_json(ORDERS_MAP_FILE, rules)
+
+
 def load_manual_reprints():
-    # Без тестовых фантомных записей: пустой список, пока пользователь сам не добавит повтор
     if not MANUAL_FILE.exists():
         return []
     raw = load_json(MANUAL_FILE, [])

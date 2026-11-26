@@ -4,9 +4,9 @@ import sys
 import threading
 from pathlib import Path
 
-VERSION = "3.0.0-live"
+VERSION = "3.1.0-gsheets"
 GITHUB_REPO = "TelliBronde/BL_Autologger"
-MODULES = ["config.py", "connector.py", "parser.py", "report.py", "main.py"]
+MODULES = ["config.py", "connector.py", "parser.py", "gsheets.py", "report.py", "main.py"]
 
 if getattr(sys, "frozen", False):
     HERE = Path(sys.executable).resolve().parent
@@ -22,6 +22,7 @@ MANUAL_FILE = HERE / "manual_reprints.json"
 ORDERS_MAP_FILE = HERE / "orders_map.json"
 ARCHIVE_FILE = HERE / "farm_archive.json"
 LIVE_DUMP_FILE = HERE / "history_live.json"
+GOOGLE_SYNC_STATE_FILE = HERE / "google_sync_state.json"
 
 SEARCH_DIRS = [HERE, Path.home() / "Downloads", Path.home() / "Desktop"]
 MAX_JSON_BYTES = 200 * 1024 * 1024
@@ -70,8 +71,12 @@ def load_config():
     default_cfg = {
         "setup_done": False,
         "location_name": "",
-        "start_date": "2026-12-01",
+        "start_date": "",  # Пусто = парсить всю историю (включая старые задачи Farm Manager)
         "live_interval_sec": 60,
+        "google_enabled": False,
+        "google_webhook_url": "",
+        "google_token": "",
+        "google_sync_interval_min": 30,
         "channel": "stable",
         "github_repo": GITHUB_REPO,
         "github_token": "",
@@ -96,10 +101,6 @@ def save_odometers(data):
 
 
 def load_orders_map():
-    """
-    Правила автогруппировки файлов в заказы:
-    [{"pattern": "CHYK_4.5.0*", "order": "CHYK 4.5.0", "parts_per_plate": 1}]
-    """
     if not ORDERS_MAP_FILE.exists():
         return []
     raw = load_json(ORDERS_MAP_FILE, [])

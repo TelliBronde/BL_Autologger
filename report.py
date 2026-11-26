@@ -18,6 +18,11 @@ import config
 import connector
 import parser
 
+try:
+    import gsheets
+except ImportError:
+    gsheets = None
+
 HF = "[h]:mm"
 C_HEAD = "1F3864"
 C_SUB  = "2F5597"
@@ -39,6 +44,8 @@ if not hasattr(sys, "_bambu_live_state"):
         "status_msg": "",
         "done_cnt": 0,
         "fail_cnt": 0,
+        "last_cloud_sync": "—",
+        "cloud_status": "Выкл",
     }
 
 
@@ -247,7 +254,7 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
         cfg = config.load_config()
         loc_name = cfg.get("location_name") or "Farm"
         loc_tag = config.sanitize_filename_tag(loc_name)
-        start_date_cfg = cfg.get("start_date") or "2026-12-01"
+        start_date_cfg = (cfg.get("start_date") or "").strip()
         to_interval = float(cfg.get("to_interval_hours") or 300)
 
         parsed_all, full_printers_stat, devices_hw = parser.load_and_parse(quiet=(quiet or is_live_tick))
@@ -255,18 +262,22 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
         order_rules = config.load_orders_map()
 
         is_period = bool(date_from or date_to)
-        d_min = date_from or start_date_cfg
-        d_max = date_to or "9999-99-99"
+        if is_period:
+            d_min = date_from or "0000-00-00"
+            d_max = date_to or "9999-99-99"
+            parsed = [x for x in (parsed_all or []) if d_min <= x["date"] <= d_max]
+            period_label = f"период {d_min} — {d_max}"
+        else:
+            parsed = list(parsed_all or [])
+            scope_txt = f"с {start_date_cfg}" if start_date_cfg else "вся история"
+            period_label = f"{scope_txt} (обн. {datetime.now():%H:%M:%S})"
 
-        parsed = [x for x in (parsed_all or []) if d_min <= x["date"] <= d_max]
         printers_stat = build_period_printers_stat(parsed, full_printers_stat) if is_period else (full_printers_stat or {})
 
         done_cnt = sum(x["qty"] for x in parsed if not x.get("is_failed"))
         fail_cnt = sum(x["qty"] for x in parsed if x.get("is_failed"))
         sys._bambu_live_state["done_cnt"] = done_cnt
         sys._bambu_live_state["fail_cnt"] = fail_cnt
-
-        period_label = f"период {d_min} — {d_max}" if is_period else f"с {start_date_cfg} (обн. {datetime.now():%H:%M:%S})"
 
         safe_custom = Path(custom_filename).name if custom_filename else None
         if safe_custom:
@@ -290,14 +301,11 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
         box = Border(top=thin, bottom=thin, left=thin, right=thin)
         day_box = Border(top=med_bottom, bottom=med_bottom, left=thin, right=thin)
 
-        # Собираем уникальные файлы для "Справочника заказов"
         unique_files = sorted({x["file"] for x in parsed})
         map_end = max(500, 4 + len(unique_files) + 100)
         last_all = max(4, 3 + len(parsed))
 
-        # ======================================================================
-        # ЛИСТ 2: СПРАВОЧНИК ЗАКАЗОВ (редактируется пользователем прямо в Excel)
-        # ======================================================================
+        # 2. СПРАВОЧНИК ЗАКАЗОВ
         put(sh_map, "A1", f"Справочник заказов — {loc_name}", bold=True, size=14)
         put(
             sh_map, "A2",
@@ -330,10 +338,8 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
         sh_map.freeze_panes = "A4"
         widths(sh_map, [46, 28, 22])
 
-        # ======================================================================
-        # ЛИСТ 3: ВСЕ ЗАДАЧИ (живые формулы VLOOKUP/INDEX к справочнику заказов)
-        # ======================================================================
-        put(sh_all, "A1", f"Журнал печатей и срывов — {loc_name} ({len(parsed)} событий | {period_label})", bold=True, size=14)
+        # 3. ВСЕ ЗАДАЧИ
+        put(sh_all, "A1", f"Журнал печатей и срывов — {loc_name} ({len(parsed)} записей | {period_label})", bold=True, size=14)
         header(sh_all, 3, [
             "Локация", "Дата", "Время", "Тип", "Статус / Прогресс",
             "Заказ", "Файл (задача)", "Принтер",
@@ -379,11 +385,9 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
         sh_all.freeze_panes = "A4"
         widths(sh_all, [14, 12, 8, 11, 20, 22, 40, 20, 11, 15, 17, 15, 14, 14])
 
-        # ======================================================================
-        # ЛИСТ 1: ОБЩАЯ СВОДКА (KPI + Сводка по заказам на живых формулах)
-        # ======================================================================
+        # 1. ОБЩАЯ СВОДКА
         put(sh_sum, "A1", f"Общая сводка — {loc_name} ({period_label})", bold=True, size=15)
-        put(sh_sum, "A2", f"Обновлено: {datetime.now():%Y-%m-%d %H:%M:%S} | Учёт с: {start_date_cfg} | Порог готово/срыв: {config.SUCCESS_THRESHOLD_PCT}%", color="595959")
+        put(sh_sum, "A2", f"Обновлено: {datetime.now():%Y-%m-%d %H:%M:%S} | Порог готово/срыв: {config.SUCCESS_THRESHOLD_PCT}%", color="595959")
 
         header(sh_sum, 4, ["Ключевой показатель локации", "Значение"], fill_color=C_HEAD)
         kpis = [
@@ -405,7 +409,6 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
             sh_sum[f"B{r_k}"].border = box
             sh_sum.row_dimensions[r_k].height = 20
 
-        # Блок 2: Сводка по заказам
         put(sh_sum, "A15", "Сводка по заказам (добавь имя заказа на листе «Справочник заказов» и впиши его в пустую строку ниже)", bold=True, size=12)
         header(sh_sum, 16, [
             "Заказ", "Файлов в заказе", "Выполнено столов, шт", "Готовых деталей, шт",
@@ -444,9 +447,7 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
             sh_sum[f"{col}{ord_tot}"].border = day_box
         widths(sh_sum, [34, 18, 18, 18, 16, 17, 15, 17, 14, 15])
 
-        # ======================================================================
-        # ЛИСТ 4: ПО ДНЯМ И ФАЙЛАМ
-        # ======================================================================
+        # 4. ПО ДНЯМ И ФАЙЛАМ
         by_day = defaultdict(list)
         for x in parsed:
             by_day[x["date"]].append(x)
@@ -526,9 +527,7 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
         sh_df.freeze_panes = "A5"
         widths(sh_df, [14, 13, 42, 15, 18, 14, 15, 18])
 
-        # ======================================================================
-        # ЛИСТ 5: ДИНАМИКА ПО ДНЯМ
-        # ======================================================================
+        # 5. ДИНАМИКА ПО ДНЯМ
         put(sh_dyn, "A1", f"Динамика по дням — {loc_name} ({period_label})", bold=True, size=14)
         header(sh_dyn, 3, [
             "Локация", "Дата", "Готово, столов", "Пластик готовых, кг",
@@ -567,14 +566,12 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
         sh_dyn.freeze_panes = "A4"
         widths(sh_dyn, [14, 13, 16, 18, 15, 15, 14, 18])
 
-        # ======================================================================
-        # ЛИСТ 6: ПРИНТЕРЫ И МОТОЧАСЫ
-        # ======================================================================
+        # 6. ПРИНТЕРЫ И МОТОЧАСЫ
         put(sh_pr, "A1", f"Принтеры, моточасы и ТО — {loc_name} ({period_label})", bold=True, size=14)
         header(sh_pr, 4, [
             "Локация", "Принтер", "Модель", "Сопло", "IP / Wi-Fi",
             "Готовых, шт", "Срывов, шт", "Пластик, кг",
-            "Часы за период, ч" if is_period else "По логам (live), ч",
+            "Часы за период, ч" if is_period else "По логам фермы, ч",
             "База с экрана, ч", "Дата сверки",
             "Прирост после сверки, ч", "АКТУАЛЬНО ОДОМЕТР, ч", "Статус ТО / HMS"
         ])
@@ -642,10 +639,9 @@ def generate_report(date_from=None, date_to=None, custom_filename=None, open_fil
 
 
 def generate_period_report_interactive():
-    cfg = config.load_config()
     parsed, _, _ = parser.load_and_parse(quiet=True)
     all_dates = sorted({x["date"] for x in (parsed or []) if x.get("date") and x["date"] != "Неизвестно"})
-    min_d = all_dates[0] if all_dates else (cfg.get("start_date") or datetime.now().strftime("%Y-%m-%d"))
+    min_d = all_dates[0] if all_dates else datetime.now().strftime("%Y-%m-%d")
     max_d = all_dates[-1] if all_dates else datetime.now().strftime("%Y-%m-%d")
 
     print("\n" + "=" * 78)
@@ -667,12 +663,9 @@ def generate_period_report_interactive():
 
 
 def _background_live_worker():
-    """
-    Каждые 30 секунд: забирает события в farm_archive.json и шлёт пульс в окно фермы.
-    Каждые state['interval'] секунд: обновляет локальный Excel-файл.
-    """
     state = sys._bambu_live_state
     last_excel_ts = time.time()
+    last_cloud_ts = 0.0
 
     while state["active"]:
         for _ in range(30):
@@ -687,7 +680,10 @@ def _background_live_worker():
 
         try:
             now_ts = time.time()
-            # Если прошёл интервал — обновляем Excel, иначе просто синкаем архив + пульс
+            cfg = config.load_config()
+            hb_ok = True
+            hb_msg = state.get("status_msg") or "ОК"
+
             if (now_ts - last_excel_ts) >= state["interval"]:
                 _, ok, msg = generate_report(
                     custom_filename=state["file"],
@@ -698,18 +694,32 @@ def _background_live_worker():
                 last_excel_ts = now_ts
                 state["last_update"] = datetime.now().strftime("%H:%M:%S")
                 state["status_msg"] = msg
-                connector.send_heartbeat(
-                    live=True, ok=ok, msg=msg,
-                    last_save=state["last_update"],
-                    done=state["done_cnt"], fail=state["fail_cnt"],
-                )
+                hb_ok = ok
+                hb_msg = msg
             else:
-                parser.sync_live_into_archive(quiet=True)
-                connector.send_heartbeat(
-                    live=True, ok=True, msg=state.get("status_msg") or "ОК",
-                    last_save=state["last_update"],
-                    done=state["done_cnt"], fail=state["fail_cnt"],
-                )
+                parser.sync_live_into_archive(quiet=True, scan_external_dumps=False)
+
+            if gsheets and cfg.get("google_enabled") and cfg.get("google_webhook_url"):
+                cloud_interval = max(5, int(cfg.get("google_sync_interval_min") or 30)) * 60
+                if (now_ts - last_cloud_ts) >= cloud_interval:
+                    c_ok, c_msg = gsheets.push_to_google(
+                        live_active=True,
+                        note=state.get("status_msg") or "ОК",
+                        quiet=True,
+                    )
+                    last_cloud_ts = now_ts
+                    state["cloud_status"] = c_msg
+                    if c_ok:
+                        state["last_cloud_sync"] = datetime.now().strftime("%H:%M")
+                    else:
+                        hb_ok = False
+                        hb_msg = c_msg
+
+            connector.send_heartbeat(
+                live=True, ok=hb_ok, msg=hb_msg,
+                last_save=state["last_update"],
+                done=state["done_cnt"], fail=state["fail_cnt"],
+            )
         except Exception as e:
             err_txt = str(e)[:60]
             state["status_msg"] = f"Ошибка: {err_txt}"
@@ -740,7 +750,7 @@ def toggle_live_excel_background(auto_mode=False):
         interval = max(30, int(cfg.get("live_interval_sec") or 60))
     else:
         print("\n" + "=" * 78)
-        print(" 🔴 ЗАПУСК ФОНОВОЙ LIVE-ЗАПИСИ (АРХИВ + EXCEL + ПУЛЬС В ОКНЕ ФЕРМЫ)")
+        print(" 🔴 ЗАПУСК ФОНОВОЙ LIVE-ЗАПИСИ (АРХИВ + EXCEL + GOOGLE SHEETS + ПУЛЬС)")
         print("=" * 78)
         def_i = int(cfg.get("live_interval_sec") or 60)
         sec_str = input(f"Интервал обновления Excel в секундах [Enter = {def_i} сек]: ").strip()

@@ -12,6 +12,10 @@ from datetime import datetime
 import config
 import connector
 import parser
+try:
+    import gsheets
+except ImportError:
+    gsheets = None
 import report
 
 
@@ -19,7 +23,8 @@ def reload_disk_modules():
     cfg = config.load_config()
     if getattr(sys, "frozen", False) and not cfg.get("allow_disk_override", True):
         return
-    for mod_file in ("config.py", "connector.py", "parser.py", "report.py"):
+    # Важен порядок: gsheets подгружается до report
+    for mod_file in ("config.py", "connector.py", "parser.py", "gsheets.py", "report.py"):
         mod_name = mod_file[:-3]
         disk_path = config.HERE / mod_file
         if disk_path.exists():
@@ -43,7 +48,6 @@ def restart_self():
 
 
 def first_run_wizard(force=False):
-    """Окно приветствия и первичной настройки локации + автономного режима."""
     cfg = config.load_config()
     if cfg.get("setup_done") and cfg.get("location_name") and not force:
         return
@@ -52,23 +56,30 @@ def first_run_wizard(force=False):
     print("=" * 78)
     print(" 👋 ДОБРО ПОЖАЛОВАТЬ В BAMBU FARM CONTROL v" + config.VERSION)
     print("=" * 78)
-    print(" Первичная настройка компьютера фермы (выполняется один раз).\n")
+    print(" Настройка локации и автономного режима.\n")
 
     cur_loc = cfg.get("location_name") or ""
     while True:
-        prompt_loc = f" 1. Укажите название локации для отчётов (например, Odesa / Kyiv) [{cur_loc}]: " if cur_loc else " 1. Укажите название локации для отчётов (например, Odesa / Kyiv): "
+        prompt_loc = (
+            f" 1. Название локации для отчётов и Google (Odesa / Kyiv) [{cur_loc}]: "
+            if cur_loc else " 1. Название локации для отчётов и Google (Odesa / Kyiv): "
+        )
         loc = parser.clean_str(input(prompt_loc)) or cur_loc
         if loc:
             cfg["location_name"] = loc
             break
         print("    ❌ Название локации не может быть пустым.")
 
-    cur_sd = cfg.get("start_date") or "2026-12-01"
-    today_s = datetime.now().strftime("%Y-%m-%d")
-    raw_sd = input(f" 2. Дата старта чистого Live-учёта [Enter = {cur_sd}, или '{today_s}' для теста]: ").strip()
-    cfg["start_date"] = report.parse_user_date(raw_sd, cur_sd)
+    cur_sd = (cfg.get("start_date") or "").strip()
+    sd_hint = cur_sd if cur_sd else "вся история"
+    print(" 2. Дата начала учёта (введи '0' или оставь пусто = брать ВСЮ историю, включая старые задачи):")
+    raw_sd = input(f"    Дата [Enter = оставить ({sd_hint}), или ГГГГ-ММ-ДД / 0]: ").strip()
+    if raw_sd == "0":
+        cfg["start_date"] = ""
+    elif raw_sd:
+        cfg["start_date"] = report.parse_user_date(raw_sd, cur_sd)
 
-    print("\n 3. Включить автономный режим на этом ПК?")
+    print("\n 3. Автономный режим на этом ПК:")
     print("    • Добавит Farm_Control --auto в Автозагрузку Windows")
     print("    • Допишет порт отладки 19222 в ярлыки Bambu Farm Manager Client")
     ans_auto = input("    Настроить автозапуск и ярлыки сейчас? [Enter = Да / N = Пропустить]: ").strip()
@@ -77,8 +88,80 @@ def first_run_wizard(force=False):
 
     cfg["setup_done"] = True
     config.save_config(cfg)
-    print(f"\n✅ Локация [{cfg['location_name']}] настроена! Учёт задач ведётся с {cfg['start_date']}.")
+    hist_msg = f"с {cfg['start_date']}" if cfg["start_date"] else "вся история"
+    print(f"\n✅ Локация [{cfg['location_name']}] настроена! Учёт задач: {hist_msg}.")
     input("\nНажми Enter для перехода в главное меню...")
+
+
+def google_sheets_menu():
+    if gsheets is None:
+        print("❌ Модуль gsheets.py не найден. Обнови модули с GitHub.")
+        return
+
+    while True:
+        cfg = config.load_config()
+        en = cfg.get("google_enabled", False)
+        url = cfg.get("google_webhook_url") or "(не задан)"
+        tok_mask = ("***" + cfg["google_token"][-4:]) if cfg.get("google_token") else "(не задан)"
+        mins = cfg.get("google_sync_interval_min", 30)
+
+        print("\n" + "=" * 78)
+        print(" ☁️ ИНТЕГРАЦИЯ С GOOGLE SHEETS (WEBHOOK)")
+        print("=" * 78)
+        print(f" Автовыгрузка: {'🟢 ВКЛ' if en else '⚪ ВЫКЛ'} (каждые {mins} мин)")
+        print(f" Локация:      {cfg.get('location_name') or '(не задана)'}")
+        print(f" Webhook URL:  {url[:62]}{'...' if len(url) > 62 else ''}")
+        print(f" Ключ локации: {tok_mask}")
+        print("-" * 78)
+        print("  [1] 🔗 Указать Webhook URL (https://script.google.com/.../exec)")
+        print("  [2] 🔑 Указать секретный ключ этой локации (из LOCATION_KEYS)")
+        print("  [3] ⏱️ Изменить интервал выгрузки (мин)")
+        print(f"  [4] {'⏹️ Выключить' if en else '🟢 Включить'} автовыгрузку в Google")
+        print("  [5] 🚀 Проверить связь и отправить данные СЕЙЧАС")
+        print("  [6] 🔄 Сбросить локальный кэш отправленных ID (перепроверить архив)")
+        print("  [Enter] Назад")
+        sub = input("> ").strip()
+
+        if sub == "1":
+            u = input("Вставь URL веб-приложения Apps Script: ").strip()
+            if u.startswith("https://"):
+                cfg["google_webhook_url"] = u
+                config.save_config(cfg)
+                print("✅ URL сохранён!")
+            else:
+                print("❌ Ссылка должна начинаться с https://")
+        elif sub == "2":
+            t = getpass.getpass("Секретный ключ этой локации (ввод скрыт): ").strip() or input("Ключ: ").strip()
+            if t:
+                cfg["google_token"] = t
+                config.save_config(cfg)
+                print("✅ Ключ локации сохранён!")
+        elif sub == "3":
+            m = input("Интервал в минутах (минимум 5, по умолчанию 30): ").strip()
+            if m.isdigit() and int(m) >= 5:
+                cfg["google_sync_interval_min"] = int(m)
+                config.save_config(cfg)
+        elif sub == "4":
+            cfg["google_enabled"] = not en
+            config.save_config(cfg)
+        elif sub == "5":
+            print("⏳ Отправляем данные и статус-пинг в Google Sheets...")
+            ok, msg = gsheets.push_to_google(
+                live_active=report.get_live_state().get("active", False),
+                note="Ручная проверка",
+                quiet=False,
+            )
+            st = report.get_live_state()
+            st["cloud_status"] = msg
+            if ok:
+                st["last_cloud_sync"] = datetime.now().strftime("%H:%M")
+            print("Результат:", msg)
+            input("Нажми Enter...")
+        elif sub == "6":
+            gsheets.reset_sync_cache()
+            input("Нажми Enter...")
+        else:
+            break
 
 
 def orders_map_menu():
@@ -90,7 +173,7 @@ def orders_map_menu():
         print(" Поддерживаются маски * (например, CHYK_4.5.0* -> Заказ CHYK 4.5.0)")
         print("-" * 78)
         if not rules:
-            print("  (Правил пока нет — все новые файлы можно группировать прямо в Excel)")
+            print("  (Правил пока нет — новые файлы можно группировать прямо в Excel / Google)")
         for idx, r in enumerate(rules, 1):
             print(f"  [{idx:2d}] Маска: {r['pattern']:<28} -> Заказ: {r['order']:<22} | Деталей/стол: {r['parts_per_plate']}")
         print("-" * 78)
@@ -129,7 +212,7 @@ def sync_modules_from_github(target_branch=None):
 
     repo = cfg.get("github_repo", config.GITHUB_REPO)
     token = (cfg.get("github_token") or "").strip()
-    headers = {"User-Agent": "BambuFarmControl/3.0", "Cache-Control": "no-cache"}
+    headers = {"User-Agent": f"BambuFarmControl/{config.VERSION}", "Cache-Control": "no-cache"}
     if token:
         headers["Authorization"] = f"token {token}"
 
@@ -200,7 +283,6 @@ def main_menu():
     reload_disk_modules()
     first_run_wizard(force=False)
 
-    # Автономный запуск при старте Windows (--auto)
     if "--auto" in sys.argv:
         print("⚡ Автономный запуск (--auto): проверка ярлыков, запуск фермы и Live-записи...")
         connector.ensure_shortcuts_silently()
@@ -211,7 +293,7 @@ def main_menu():
         os.system("cls" if os.name == "nt" else "clear")
         cfg = config.load_config()
         loc_name = cfg.get("location_name") or "Не задана"
-        start_d = cfg.get("start_date") or "2026-12-01"
+        start_d = (cfg.get("start_date") or "").strip() or "Вся история"
         proc_ok = connector.is_farm_process_running()
         cdp_ok = bool(connector.get_cdp_ws_url())
         net_warn = connector.check_port_network_exposure()
@@ -235,13 +317,19 @@ def main_menu():
             btn4_text = "⏹️ Остановить фоновую Live-запись"
         else:
             live_header = "⚪ LIVE-ЗАПИСЬ: ВЫКЛ"
-            btn4_text = "🔴 Включить фоновую Live-запись (архив + Excel + пульс)"
+            btn4_text = "🔴 Включить фоновую Live-запись (архив + Excel + Google + пульс)"
+
+        g_str = (
+            f"🟢 ВКЛ (посл. {live_st.get('last_cloud_sync', '—')} | {live_st.get('cloud_status', 'Ожидание')})"
+            if cfg.get("google_enabled") else "⚪ ВЫКЛ"
+        )
 
         print("==========================================================================")
         print(f"   BAMBU FARM CONTROL v{config.VERSION} | Локация: {loc_name} | {branch_badge}")
         print("==========================================================================")
-        print(f" Статус фермы:  {status_str} | Учёт с: {start_d}")
+        print(f" Статус фермы:  {status_str} | Учёт: {start_d}")
         print(f" Живая таблица: {live_header}")
+        print(f" Google Sheets: {g_str}")
         if net_warn:
             print(f" {net_warn}")
         print("--------------------------------------------------------------------------")
@@ -251,7 +339,7 @@ def main_menu():
         print(f"  [4] {btn4_text}")
         print("  [5] 🔧 Сверка моточасов с экрана принтера (Одометр + ТО)")
         print("  [6] 📦 Справочник автогруппировки заказов / Ручные повторы")
-        print("  [7] ⚙️ Локация, Автозагрузка, Ярлыки и Обновления GitHub")
+        print("  [7] ⚙️ Google Sheets, Локация, Автозагрузка, Ярлыки и GitHub")
         print("  [0] Выход")
         print("==========================================================================")
         choice = input("Выбери пункт меню: ").strip()
@@ -303,15 +391,16 @@ def main_menu():
                             config.save_manual_reprints(items)
             elif choice == "7":
                 override_st = "ВКЛ" if cfg.get("allow_disk_override", True) else "ВЫКЛ (только ядро .exe)"
-                print("\n--- ⚙️ СИСТЕМА, ЛОКАЦИЯ И GITHUB ---")
+                print("\n--- ⚙️ СИСТЕМА, GOOGLE SHEETS И GITHUB ---")
                 print("  [1] 🟢 Обновить модули с GitHub — STABLE (main)")
                 print("  [2] 🧪 Обновить модули с GitHub — TEST (test)")
                 print("  [3] ⏪ Откатить модули на предыдущий бэкап")
-                print("  [4] 🏷️ Изменить локацию / дату старта учёта")
+                print("  [4] 🏷️ Изменить локацию / дату начала учёта (или включить всю историю)")
                 print("  [5] 🤖 Настроить Автозапуск + ярлыки Bambu (повторить мастер)")
                 print("  [6] 🧹 Удалить Автозапуск и очистить ярлыки Bambu")
                 print("  [7] 🔑 Указать GitHub Token (Read-Only)")
                 print(f"  [8] 🔒 Подгрузка внешних .py файлов в .exe: [{override_st}]")
+                print("  [9] ☁️ Google Sheets (Webhook URL, ключ локации, тест отправки)")
                 sub = input("> ").strip()
                 if sub == "1":
                     sync_modules_from_github("main")
@@ -334,6 +423,9 @@ def main_menu():
                     cfg["allow_disk_override"] = not cfg.get("allow_disk_override", True)
                     config.save_config(cfg)
                     print(f"✅ Подгрузка внешних .py: {'ВКЛ' if cfg['allow_disk_override'] else 'ВЫКЛ'}")
+                elif sub == "9":
+                    google_sheets_menu()
+                    continue
                 input("\nНажми Enter...")
             elif choice == "0":
                 report.get_live_state()["active"] = False

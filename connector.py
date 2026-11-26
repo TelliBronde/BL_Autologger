@@ -11,10 +11,9 @@ import websocket
 import config
 
 # JS-радар v7:
-# - Конечный автомат по /devices2 (PAUSE не считается срывом, порог готово/срыв = 95%)
-# - Кэш метрик файлов (вес/время) для повторов с экрана и расчёта веса срывов
-# - Ротация localStorage
-# - Двусторонний статус-бар Heartbeat (Зелёный / Жёлтый / Красный баннер)
+# - Перехватывает старые и текущие задачи из вкладки Tasks (window.__tasksMap)
+# - Отслеживает живые финиши/срывы по /devices2 (порог 95%, PAUSE не считается срывом)
+# - Хранит ротируемый буфер в localStorage и рисует статус-бар с двусторонним Heartbeat
 JS_HOOK = r"""
 (() => {
   const THRESHOLD = 95;
@@ -27,7 +26,7 @@ JS_HOOK = r"""
     ts: 0, live: false, ok: true, msg: 'Ожидание подключения...', loc: '', last_save: '—', done: 0, fail: 0
   };
 
-  const MAX_TASKS = 1500;
+  const MAX_TASKS = 3000;
   const MAX_EVENTS = 2500;
 
   const stripExt = (n) => String(n || '').trim().replace(/\.(gcode\.3mf|3mf|gcode)$/i, '');
@@ -99,6 +98,11 @@ JS_HOOK = r"""
     } catch (e) {
       try {
         window.__eventsLog = window.__eventsLog.slice(-800);
+        const keys = Object.keys(window.__tasksMap).sort((a, b) => Number(a) - Number(b));
+        if (keys.length > 1000) {
+          keys.slice(0, keys.length - 1000).forEach(k => delete window.__tasksMap[k]);
+        }
+        localStorage.setItem('__bambu_tasks_v3', JSON.stringify(window.__tasksMap));
         localStorage.setItem('__bambu_events_v3', JSON.stringify(window.__eventsLog));
       } catch (_) {}
     }
@@ -113,7 +117,7 @@ JS_HOOK = r"""
     window.__eventsLog.push({
       dev_id: id,
       dev_name: devName,
-      outcome: outcome, // 'done' | 'failed'
+      outcome: outcome,
       pct: outcome === 'done' ? 100 : Math.max(1, Math.min(99, Math.round(pctVal || 1))),
       start_time: prev.start_time || null,
       finish_time: new Date().toISOString(),
@@ -183,7 +187,6 @@ JS_HOOK = r"""
           next.weight_g = taskWeight;
           next.pred_secs = taskSecs;
         } else {
-          // Быстрый перезапуск печати поверх завершённой (без промежуточного IDLE/FINISH)
           if (prev.max_pct >= THRESHOLD && pct <= 15) {
             emitEvent(prev, id, devName, 'done', 100, fileName, taskId);
             changed = true;
@@ -195,7 +198,6 @@ JS_HOOK = r"""
             next.weight_g = taskWeight;
             next.pred_secs = taskSecs;
           } else if (prev.max_pct >= 1 && prev.max_pct < THRESHOLD && pct <= 5 && (prev.max_pct - pct) >= 15 && state === 'RUNNING') {
-            // Быстрый перезапуск после срыва
             emitEvent(prev, id, devName, 'failed', prev.max_pct, fileName, taskId);
             changed = true;
             next.start_time = new Date().toISOString();
@@ -215,7 +217,6 @@ JS_HOOK = r"""
           }
         }
       } else if (state === 'PAUSE') {
-        // Пауза — не срыв! Сохраняем активный контекст и ждём возобновления или отмены
         next.active = prev.active;
         next.max_pct = Math.max(prev.max_pct || 0, pct);
       } else if (state === 'FINISH') {
@@ -339,12 +340,13 @@ JS_HOOK = r"""
       const hb = window.__bambuHb || {};
       const ageSec = hb.ts ? Math.floor((Date.now() - hb.ts) / 1000) : 999999;
       const pCount = Object.keys(window.__devicesInfo || {}).length;
+      const tCount = Object.keys(window.__tasksMap || {}).length;
       const locTag = hb.loc ? `[${hb.loc}] ` : '';
 
       if (!hb.ts || !hb.live) {
         box.style.background = '#b8860b';
         box.style.borderColor = '#ffd700';
-        badge.textContent = `🟡 ${locTag}LIVE ВЫКЛ — включите Live-запись в Farm_Control | 🖨️ Принтеров: ${pCount}`;
+        badge.textContent = `🟡 ${locTag}LIVE ВЫКЛ | 📦 Задач: ${tCount} | 🖨️ Принтеров: ${pCount} (включите Live в Farm_Control)`;
       } else if (hb.ok === false) {
         box.style.background = '#c0392b';
         box.style.borderColor = '#ff7675';
@@ -361,7 +363,7 @@ JS_HOOK = r"""
         box.style.background = '#1e7e34';
         box.style.borderColor = '#2ecc71';
         const extra = hb.msg && hb.msg !== 'ОК' ? ` | ⚠️ ${hb.msg}` : '';
-        badge.textContent = `🟢 ${locTag}LIVE OK | Запись: ${hb.last_save || '—'} | ✅ ${hb.done ?? 0} | ❌ Срывы: ${hb.fail ?? 0} | 🖨️ ${pCount}${extra}`;
+        badge.textContent = `🟢 ${locTag}LIVE OK | Запись: ${hb.last_save || '—'} | ✅ ${hb.done ?? 0} | ❌ Срывы: ${hb.fail ?? 0} | 📦 ${tCount} | 🖨️ ${pCount}${extra}`;
       }
     };
     window.__updateBambuUI();
@@ -372,7 +374,7 @@ JS_HOOK = r"""
       }, 10000);
     }
   }
-  return Object.keys(window.__eventsLog).length;
+  return Object.keys(window.__tasksMap).length;
 })();
 """
 
@@ -478,7 +480,6 @@ def cdp_eval(expression, timeout=5.0, bring_to_front=False):
 
 
 def send_heartbeat(live: bool, ok: bool = True, msg: str = "ОК", last_save: str = "—", done: int = 0, fail: int = 0):
-    """Отправляет пульс и статистику в статус-бар окна Bambu Farm Manager."""
     if not get_cdp_ws_url():
         return False
     cfg = config.load_config()
@@ -535,7 +536,7 @@ def start_farm_with_hook(auto_mode=False):
     if proc_alive and ws_url:
         cnt = cdp_eval(JS_HOOK, bring_to_front=(not auto_mode))
         if not auto_mode:
-            print(f"✅ Ферма уже подключена! (Событий в памяти: {cnt})")
+            print(f"✅ Ферма уже подключена! (Задач в памяти: {cnt})")
             ans = input("Перезапустить ферму с нуля? [R = Перезапустить / Enter = Оставить]: ").strip()
             if ans.upper() != "R":
                 return True
@@ -573,7 +574,7 @@ def start_farm_with_hook(auto_mode=False):
             cnt = cdp_eval(JS_HOOK, bring_to_front=(not auto_mode))
             if cnt is not None:
                 if not auto_mode:
-                    print(f"✅ Ферма открыта, автологгер подключён! (Событий в памяти: {cnt})")
+                    print(f"✅ Ферма открыта, автологгер подключён! (Задач в памяти: {cnt})")
                     warn = check_port_network_exposure()
                     if warn:
                         print(warn)
@@ -630,7 +631,6 @@ foreach ($d in $dirs) {
             $tp = ($sc.TargetPath + '').ToLower()
             if ($tp.EndsWith($farmExe)) {
                 $args = ($sc.Arguments + '').Trim()
-                # Чистим старый небезопасный флаг и старые порты
                 $cleanArgs = ($args -replace '--remote-allow-origins=\S*', '' -replace '--remote-debugging-port=\d+', '').Trim()
                 if ($mode -eq 'patch_bambu') {
                     $newArgs = if ($cleanArgs) { "$cleanArgs $portFlag" } else { $portFlag }
@@ -693,7 +693,6 @@ def _run_ps_shortcut_helper(mode: str, elevate: bool = False):
             )
             return res.stdout or ""
         else:
-            # Передаём только безопасные env-переменные через wrapper-вызов с UAC
             wrapper = (
                 f"$env:BF_MODE='{mode}';"
                 f"$env:BF_PORT='{config.CDP_PORT}';"
@@ -720,7 +719,6 @@ def _run_ps_shortcut_helper(mode: str, elevate: bool = False):
 
 
 def setup_autostart_and_shortcuts(interactive=True):
-    """Прописывает Farm_Control --auto в Автозагрузку и добавляет порт 19222 в ярлыки Bambu."""
     out1 = _run_ps_shortcut_helper("install_startup", elevate=False)
     if interactive:
         if "STARTUP_OK" in out1:
@@ -745,12 +743,10 @@ def setup_autostart_and_shortcuts(interactive=True):
 
 
 def ensure_shortcuts_silently():
-    """Тихая проверка пользовательских ярлыков при старте (на случай обновления клиента Bambu)."""
     _run_ps_shortcut_helper("patch_bambu", elevate=False)
 
 
 def remove_autostart_and_shortcuts():
-    """Полностью убирает автозапуск и очищает флаг порта из всех ярлыков Bambu."""
     _run_ps_shortcut_helper("remove_startup", elevate=False)
     print("  ✅ Ярлык из Автозагрузки Windows удалён.")
     out = _run_ps_shortcut_helper("unpatch_bambu", elevate=False)

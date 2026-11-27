@@ -98,7 +98,6 @@ def match_order_rule(filename: str, rules: list):
 
 
 def find_history_json_files():
-    """Находит локальные history*.json / timelogger*.txt (в папке скрипта, Загрузках и Рабочем столе)."""
     found = []
     for d in config.SEARCH_DIRS:
         if not d.exists():
@@ -211,7 +210,6 @@ def _save_archive(arch: dict):
 def _merge_raw_payload_into_archive(raw_data, arch: dict) -> bool:
     changed = False
 
-    # 1. Задачи Farm Manager (включая старые выполненные таски)
     for t in walk_tasks(raw_data):
         tid = str(t.get("id") or "")
         if not tid:
@@ -228,7 +226,6 @@ def _merge_raw_payload_into_archive(raw_data, arch: dict) -> bool:
             arch["tasks"][tid] = t
             changed = True
 
-    # 2. Живые события v3 (__events_log__)
     for ev in walk_events(raw_data):
         f_dt = parse_iso_local(ev.get("finish_time"))
         if not f_dt:
@@ -238,7 +235,6 @@ def _merge_raw_payload_into_archive(raw_data, arch: dict) -> bool:
             arch["events"][ev_key] = ev
             changed = True
 
-    # 3. Старые повторы из прошлых history*.json (__reprints_list__)
     for rep in walk_legacy_reprints(raw_data):
         f_dt = parse_iso_local(rep.get("finish_time"))
         if not f_dt:
@@ -248,14 +244,12 @@ def _merge_raw_payload_into_archive(raw_data, arch: dict) -> bool:
             arch["legacy_reprints"][r_key] = rep
             changed = True
 
-    # 4. Устройства
     for dinfo in walk_devices_info(raw_data):
         dname = clean_str(dinfo.get("name"))
         if dname:
             arch["devices"][dname] = dinfo
             changed = True
 
-    # 5. Кэш метрик
     if isinstance(raw_data, list):
         for block in raw_data:
             if isinstance(block, dict) and isinstance(block.get("__metrics_cache__"), dict):
@@ -268,10 +262,6 @@ def _merge_raw_payload_into_archive(raw_data, arch: dict) -> bool:
 
 
 def sync_live_into_archive(quiet=True, scan_external_dumps=False):
-    """
-    Забирает живые данные (включая старые таски из вкладки Tasks) из окна фермы,
-    а при scan_external_dumps=True также подхватывает старые history*.json файлы.
-    """
     with config.get_lock():
         arch = _load_archive()
         changed = False
@@ -309,12 +299,6 @@ def sync_live_into_archive(quiet=True, scan_external_dumps=False):
 
 
 def load_and_parse(quiet=False):
-    """
-    Собирает полную историю:
-    1) Живые события (точные финиши и срывы с % прогресса)
-    2) Старые и текущие выполненные/отменённые таски из Farm Manager и history*.json (с дедупликацией)
-    3) Повторы из старых дампов и ручные повторы
-    """
     with config.get_lock():
         cfg = config.load_config()
         start_date_str = (cfg.get("start_date") or "").strip()
@@ -363,13 +347,17 @@ def load_and_parse(quiet=False):
         live_fail_by_task = defaultdict(int)
         live_by_printer_dt = defaultdict(list)
 
-        # 1. ЖИВЫЕ СОБЫТИЯ (Готово + Срывы с точным %)
-        for ev_key, ev in arch.get("events", {}).items():
+        # Сортируем живые события хронологически и вычищаем пост-финишные дубли
+        sorted_events = sorted(
+            arch.get("events", {}).items(),
+            key=lambda kv: parse_iso_local(kv[1].get("finish_time")) or datetime.min
+        )
+        last_done_by_printer_file = {}
+        dup_keys_to_purge = []
+
+        for ev_key, ev in sorted_events:
             f_dt = parse_iso_local(ev.get("finish_time"))
             if not f_dt:
-                continue
-            date_str = f_dt.strftime("%Y-%m-%d")
-            if start_date_str and date_str < start_date_str:
                 continue
 
             dn = clean_str(ev.get("dev_name") or ev.get("dev_id") or "Unknown")
@@ -394,6 +382,20 @@ def load_and_parse(quiet=False):
                 clean_name = c_n or clean_name
                 weight_one = weight_one or (w_n or 0.0)
                 secs_one = secs_one or (s_n or 0)
+
+            # Проверка на физически невозможный дубль финиша одного и того же файла на том же принтере
+            if outcome == "done":
+                pf_key = (dn.lower(), raw_ev_file.lower())
+                min_gap_sec = max(120, int(secs_one * 0.6)) if secs_one > 0 else 300
+                prev_dt = last_done_by_printer_file.get(pf_key)
+                if prev_dt and 0 <= (f_dt - prev_dt).total_seconds() < min_gap_sec:
+                    dup_keys_to_purge.append(ev_key)
+                    continue
+                last_done_by_printer_file[pf_key] = f_dt
+
+            date_str = f_dt.strftime("%Y-%m-%d")
+            if start_date_str and date_str < start_date_str:
+                continue
 
             ratio = 1.0 if outcome == "done" else (pct / 100.0)
             used_weight = weight_one * ratio
@@ -442,7 +444,14 @@ def load_and_parse(quiet=False):
                 "printers": dn,
             })
 
-        # 2. СТАРЫЕ И ТЕКУЩИЕ ВЫПОЛНЕННЫЕ / ОТМЕНЁННЫЕ ТАСКИ ИЗ FARM MANAGER (Tasks + history*.json)
+        # Удаляем найденные дубли из локального архива farm_archive.json
+        if dup_keys_to_purge:
+            for dk in dup_keys_to_purge:
+                arch["events"].pop(dk, None)
+            _save_archive(arch)
+            if not quiet:
+                print(f"🧹 Автоочистка: удалено {len(dup_keys_to_purge)} дублирующихся записей из архива.")
+
         for tid, t in arch.get("tasks", {}).items():
             stats = t.get("statistics") if isinstance(t.get("statistics"), dict) else {}
             fin_cnt = safe_int(stats.get("finished"), 1 if not stats else 0)
@@ -478,7 +487,6 @@ def load_and_parse(quiet=False):
             dev_names = [x for x in dev_names if x]
             printers_str = ", ".join(dev_names) or "—"
 
-            # Сохраняем историю принтеров для привязки старых повторов
             for dn in dev_names:
                 if c_dt:
                     printer_history[dn].append({
@@ -486,14 +494,12 @@ def load_and_parse(quiet=False):
                         "clean_name": clean_name, "secs_one": secs_one, "weight_one": weight_one,
                     })
 
-            # Учёт часов текущей печати (ongoing) в одометре принтеров
             if t.get("state") == "ongoing" and printing_now > 0 and dev_names:
                 for dn in dev_names:
                     hw = devices_hw.get(dn)
                     if hw and hw.get("mc_percent", 0) > 0 and secs_one > 0:
                         add_printer_time(dn, datetime.now(), secs_one * (hw["mc_percent"] / 100.0), is_waste=False)
 
-            # Дедупликация с живыми событиями
             matched_done = live_done_by_task.get(tid, 0)
             if matched_done == 0 and dev_names and dt:
                 for dn in dev_names:
@@ -548,7 +554,6 @@ def load_and_parse(quiet=False):
 
             missing_fail = max(0, stp_cnt - matched_fail)
             if missing_fail > 0:
-                # Для старых отмен без %: если один стол — оцениваем по времени, иначе 50%
                 if total_p <= 1 and c_dt and f_dt and f_dt > c_dt and secs_one > 0:
                     actual_s = max(60.0, min(float(secs_one), (f_dt - c_dt).total_seconds()))
                     ratio = min(0.95, actual_s / float(secs_one))
@@ -583,7 +588,6 @@ def load_and_parse(quiet=False):
                     "printers": printers_str,
                 })
 
-        # 3. СТАРЫЕ ПОВТОРЫ ИЗ ПРОШЛЫХ history*.json (__reprints_list__)
         for dn in printer_history:
             printer_history[dn].sort(key=lambda x: x["create_dt"])
 
@@ -597,7 +601,6 @@ def load_and_parse(quiet=False):
             if start_date_str and date_str < start_date_str:
                 continue
 
-            # Не дублируем, если уже есть в живых событиях или в тасках фермы
             if any(abs((f_dt - ev_dt).total_seconds()) <= 600 for ev_dt, _ in live_by_printer_dt.get(dn, [])):
                 continue
 
@@ -653,7 +656,6 @@ def load_and_parse(quiet=False):
                 "printers": dn,
             })
 
-        # 4. РУЧНЫЕ ПОВТОРЫ
         for item in config.load_manual_reprints():
             m_date, m_printer, m_file, m_qty = item["date"], item["printer"], item["file"], safe_int(item["qty"])
             if m_qty <= 0 or (start_date_str and m_date < start_date_str):

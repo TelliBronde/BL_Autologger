@@ -4,7 +4,7 @@ import sys
 import threading
 from pathlib import Path
 
-VERSION = "3.1.0-gsheets"
+VERSION = "3.1.2-fix-dup"
 GITHUB_REPO = "TelliBronde/BL_Autologger"
 MODULES = ["config.py", "connector.py", "parser.py", "gsheets.py", "report.py", "main.py"]
 
@@ -71,7 +71,7 @@ def load_config():
     default_cfg = {
         "setup_done": False,
         "location_name": "",
-        "start_date": "",  # Пусто = парсить всю историю (включая старые задачи Farm Manager)
+        "start_date": "",
         "live_interval_sec": 60,
         "google_enabled": False,
         "google_webhook_url": "",
@@ -84,7 +84,8 @@ def load_config():
         "to_interval_hours": 300,
     }
     cfg = load_json(CONFIG_FILE, {})
-    default_cfg.update(cfg)
+    if isinstance(cfg, dict):
+        default_cfg.update(cfg)
     return default_cfg
 
 

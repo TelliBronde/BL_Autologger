@@ -13,20 +13,24 @@ import config
 
 JS_HOOK = r"""
 (() => {
+  const HOOK_VER = 9;
   const THRESHOLD = 95;
   window.__tasksMap = JSON.parse(localStorage.getItem('__bambu_tasks_v3') || '{}');
   window.__eventsLog = JSON.parse(localStorage.getItem('__bambu_events_v3') || '[]');
   window.__devicesInfo = JSON.parse(localStorage.getItem('__bambu_devices_v3') || '{}');
   window.__metricsCache = JSON.parse(localStorage.getItem('__bambu_metrics_v3') || '{}');
   window.__pState = window.__pState || {};
+  window.__emittedSubtasks = window.__emittedSubtasks || {};
   window.__bambuHb = window.__bambuHb || {
     ts: 0, live: false, ok: true, msg: 'Ожидание подключения...', loc: '', last_save: '—', done: 0, fail: 0
   };
+  window.__bambuHookVer = HOOK_VER;
 
   const MAX_TASKS = 3000;
   const MAX_EVENTS = 2500;
 
   const stripExt = (n) => String(n || '').trim().replace(/\.(gcode\.3mf|3mf|gcode)$/i, '');
+  const isCaliFile = (n) => /auto_cali|calibration/i.test(String(n || ''));
 
   const extractTaskMetrics = (t) => {
     let w = 0, s = 0;
@@ -108,21 +112,35 @@ JS_HOOK = r"""
 
   const emitEvent = (prev, id, devName, outcome, pctVal, fallbackFile, fallbackTaskId) => {
     const fname = prev.file || fallbackFile || '';
+    if (isCaliFile(fname)) return false;
+
     const nowMs = Date.now();
-
-    // Защита от дубля финиша одного и того же файла/subtask на одном принтере в течение 5 минут
-    if (outcome === 'done') {
-      const doneSig = `${stripExt(fname).toLowerCase()}|${prev.subtask_id || ''}`;
-      if (prev.last_done_sig === doneSig && prev.last_done_ms && (nowMs - prev.last_done_ms) < 300000) {
-        return false;
-      }
-      prev.last_done_sig = doneSig;
-      prev.last_done_ms = nowMs;
-    }
-
+    const tid = String(prev.task_id || fallbackTaskId || '');
+    const sub = String(prev.subtask_id || '');
     const cached = window.__metricsCache[stripExt(fname).toLowerCase()] || {};
     const weightG = prev.weight_g || cached.w || 0;
     const predSecs = prev.pred_secs || cached.s || 0;
+
+    // 1. Защита от фантомного "done" на старте новой печати (< 90 сек после старта для задач >= 10 мин)
+    if (outcome === 'done' && !prev.from_init && predSecs >= 600 && prev.started_ms && (nowMs - prev.started_ms) < 90000) {
+      return false;
+    }
+
+    // 2. Жёсткая дедупликация по subtask_id (для done и failed отдельно)
+    if (sub && sub !== '0') {
+      const subKey = `${id}|${tid}|${sub}|${outcome}`;
+      if (window.__emittedSubtasks[subKey]) return false;
+      window.__emittedSubtasks[subKey] = nowMs;
+    }
+
+    // 3. Временная защита от дубля на том же принтере+файле (5 мин для done и failed)
+    const sig = `${stripExt(fname).toLowerCase()}|${outcome}`;
+    if (prev.last_emit_sig === sig && prev.last_emit_ms && (nowMs - prev.last_emit_ms) < 300000) {
+      return false;
+    }
+    prev.last_emit_sig = sig;
+    prev.last_emit_ms = nowMs;
+
     window.__eventsLog.push({
       dev_id: id,
       dev_name: devName,
@@ -131,8 +149,8 @@ JS_HOOK = r"""
       start_time: prev.start_time || null,
       finish_time: new Date(nowMs).toISOString(),
       file: fname,
-      task_id: prev.task_id || fallbackTaskId || '',
-      subtask_id: prev.subtask_id || '',
+      task_id: tid,
+      subtask_id: sub,
       weight_g: weightG,
       pred_secs: predSecs
     });
@@ -188,14 +206,23 @@ JS_HOOK = r"""
 
       if (state === 'RUNNING' || state === 'PREPARE') {
         if (!prev.active) {
-          // Игнорируем пост-финишный отскок статуса (когда принтер уже на 90-100% после FINISH)
-          if (state === 'RUNNING' && pct >= 90) {
+          // Игнорируем устаревший pct=100% на старте новой печати (PREPARE >= 90% или RUNNING == 100%)
+          if ((state === 'PREPARE' && pct >= 90) || (state === 'RUNNING' && pct >= 100)) {
             next.active = false;
             window.__pState[id] = next;
             return;
           }
+          // После FINISH/IDLE/FAILED не принимаем RUNNING >= 90% (пост-финишный отскок)
+          if (prev.state && state === 'RUNNING' && pct >= 90) {
+            next.active = false;
+            window.__pState[id] = next;
+            return;
+          }
+          const nowMs = Date.now();
           next.active = true;
-          next.start_time = new Date().toISOString();
+          next.from_init = (!prev.state);
+          next.started_ms = nowMs;
+          next.start_time = new Date(nowMs).toISOString();
           next.max_pct = pct;
           next.file = fileName;
           next.task_id = taskId;
@@ -205,9 +232,12 @@ JS_HOOK = r"""
         } else {
           if (prev.max_pct >= THRESHOLD && pct <= 15) {
             if (emitEvent(prev, id, devName, 'done', 100, fileName, taskId)) changed = true;
-            next.last_done_sig = prev.last_done_sig;
-            next.last_done_ms = prev.last_done_ms;
-            next.start_time = new Date().toISOString();
+            const nowMs = Date.now();
+            next.last_emit_sig = prev.last_emit_sig;
+            next.last_emit_ms = prev.last_emit_ms;
+            next.from_init = false;
+            next.started_ms = nowMs;
+            next.start_time = new Date(nowMs).toISOString();
             next.max_pct = pct;
             next.file = fileName;
             next.task_id = taskId;
@@ -216,7 +246,12 @@ JS_HOOK = r"""
             next.pred_secs = taskSecs;
           } else if (prev.max_pct >= 1 && prev.max_pct < THRESHOLD && pct <= 5 && (prev.max_pct - pct) >= 15 && state === 'RUNNING') {
             if (emitEvent(prev, id, devName, 'failed', prev.max_pct, fileName, taskId)) changed = true;
-            next.start_time = new Date().toISOString();
+            const nowMs = Date.now();
+            next.last_emit_sig = prev.last_emit_sig;
+            next.last_emit_ms = prev.last_emit_ms;
+            next.from_init = false;
+            next.started_ms = nowMs;
+            next.start_time = new Date(nowMs).toISOString();
             next.max_pct = pct;
             next.file = fileName;
             next.task_id = taskId;
@@ -238,8 +273,8 @@ JS_HOOK = r"""
       } else if (state === 'FINISH') {
         if (prev.active) {
           if (emitEvent(prev, id, devName, 'done', 100, fileName, taskId)) changed = true;
-          next.last_done_sig = prev.last_done_sig;
-          next.last_done_ms = prev.last_done_ms;
+          next.last_emit_sig = prev.last_emit_sig;
+          next.last_emit_ms = prev.last_emit_ms;
         }
         next.active = false;
         next.max_pct = 0;
@@ -247,8 +282,8 @@ JS_HOOK = r"""
         if (prev.active) {
           const outcome = (prev.max_pct >= THRESHOLD) ? 'done' : 'failed';
           if (emitEvent(prev, id, devName, outcome, prev.max_pct || pct, fileName, taskId)) changed = true;
-          next.last_done_sig = prev.last_done_sig;
-          next.last_done_ms = prev.last_done_ms;
+          next.last_emit_sig = prev.last_emit_sig;
+          next.last_emit_ms = prev.last_emit_ms;
         }
         next.active = false;
         next.max_pct = 0;
@@ -256,10 +291,12 @@ JS_HOOK = r"""
         if (prev.active) {
           if (prev.max_pct >= THRESHOLD) {
             if (emitEvent(prev, id, devName, 'done', 100, fileName, taskId)) changed = true;
-            next.last_done_sig = prev.last_done_sig;
-            next.last_done_ms = prev.last_done_ms;
+            next.last_emit_sig = prev.last_emit_sig;
+            next.last_emit_ms = prev.last_emit_ms;
           } else if (prev.max_pct >= 1) {
             if (emitEvent(prev, id, devName, 'failed', prev.max_pct, fileName, taskId)) changed = true;
+            next.last_emit_sig = prev.last_emit_sig;
+            next.last_emit_ms = prev.last_emit_ms;
           }
         }
         next.active = false;
@@ -287,6 +324,7 @@ JS_HOOK = r"""
     return null;
   };
 
+  // Всегда перезаписываем сам обработчик (чтобы обновления логики подхватывались без наслоения перехватчиков)
   window.__bambuProcessPayload = (u, t) => {
     try {
       if (!t || typeof t !== 'string') return;
@@ -314,8 +352,9 @@ JS_HOOK = r"""
     } catch (e) {}
   };
 
-  if (!window.__bambuHookedV8) {
-    window.__bambuHookedV8 = true;
+  // Сетевой перехватчик вешается строго один раз на вкладку
+  if (!window.__bambuNetPatched && !window.__bambuHookedV7 && !window.__bambuHookedV8) {
+    window.__bambuNetPatched = true;
     const oOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (m, u) {
       this.__u = String(u);
@@ -324,7 +363,7 @@ JS_HOOK = r"""
           let t = (this.responseType === '' || this.responseType === 'text')
             ? this.responseText
             : (typeof this.response === 'string' ? this.response : JSON.stringify(this.response));
-          window.__bambuProcessPayload(this.__u, t);
+          if (window.__bambuProcessPayload) window.__bambuProcessPayload(this.__u, t);
         } catch (e) {}
       });
       return oOpen.apply(this, arguments);
@@ -334,7 +373,7 @@ JS_HOOK = r"""
     window.fetch = function (u, o) {
       const url = String(typeof u === 'string' ? u : (u && u.url) || '');
       return oFetch.apply(this, arguments).then(r => {
-        try { r.clone().text().then(t => window.__bambuProcessPayload(url, t)).catch(() => {}); } catch (e) {}
+        try { r.clone().text().then(t => { if (window.__bambuProcessPayload) window.__bambuProcessPayload(url, t); }).catch(() => {}); } catch (e) {}
         return r;
       });
     };
@@ -510,7 +549,7 @@ def send_heartbeat(live: bool, ok: bool = True, msg: str = "ОК", last_save: st
         "done": int(done or 0),
         "fail": int(fail or 0),
     }
-    js = f"if(!window.__bambuHookedV8){{{JS_HOOK}}} if(window.__bambuSetHeartbeat){{window.__bambuSetHeartbeat({json.dumps(payload, ensure_ascii=False)});}}"
+    js = f"if(window.__bambuHookVer!==9){{{JS_HOOK}}} if(window.__bambuSetHeartbeat){{window.__bambuSetHeartbeat({json.dumps(payload, ensure_ascii=False)});}}"
     return cdp_eval(js, timeout=4.0) is not None or True
 
 

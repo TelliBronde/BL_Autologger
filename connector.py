@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import subprocess
@@ -10,10 +11,6 @@ from pathlib import Path
 import websocket
 import config
 
-# JS-радар v7:
-# - Перехватывает старые и текущие задачи из вкладки Tasks (window.__tasksMap)
-# - Отслеживает живые финиши/срывы по /devices2 (порог 95%, PAUSE не считается срывом)
-# - Хранит ротируемый буфер в localStorage и рисует статус-бар с двусторонним Heartbeat
 JS_HOOK = r"""
 (() => {
   const THRESHOLD = 95;
@@ -111,6 +108,18 @@ JS_HOOK = r"""
 
   const emitEvent = (prev, id, devName, outcome, pctVal, fallbackFile, fallbackTaskId) => {
     const fname = prev.file || fallbackFile || '';
+    const nowMs = Date.now();
+
+    // Защита от дубля финиша одного и того же файла/subtask на одном принтере в течение 5 минут
+    if (outcome === 'done') {
+      const doneSig = `${stripExt(fname).toLowerCase()}|${prev.subtask_id || ''}`;
+      if (prev.last_done_sig === doneSig && prev.last_done_ms && (nowMs - prev.last_done_ms) < 300000) {
+        return false;
+      }
+      prev.last_done_sig = doneSig;
+      prev.last_done_ms = nowMs;
+    }
+
     const cached = window.__metricsCache[stripExt(fname).toLowerCase()] || {};
     const weightG = prev.weight_g || cached.w || 0;
     const predSecs = prev.pred_secs || cached.s || 0;
@@ -120,13 +129,14 @@ JS_HOOK = r"""
       outcome: outcome,
       pct: outcome === 'done' ? 100 : Math.max(1, Math.min(99, Math.round(pctVal || 1))),
       start_time: prev.start_time || null,
-      finish_time: new Date().toISOString(),
+      finish_time: new Date(nowMs).toISOString(),
       file: fname,
       task_id: prev.task_id || fallbackTaskId || '',
       subtask_id: prev.subtask_id || '',
       weight_g: weightG,
       pred_secs: predSecs
     });
+    return true;
   };
 
   const processDevicesArray = (devices) => {
@@ -178,6 +188,12 @@ JS_HOOK = r"""
 
       if (state === 'RUNNING' || state === 'PREPARE') {
         if (!prev.active) {
+          // Игнорируем пост-финишный отскок статуса (когда принтер уже на 90-100% после FINISH)
+          if (state === 'RUNNING' && pct >= 90) {
+            next.active = false;
+            window.__pState[id] = next;
+            return;
+          }
           next.active = true;
           next.start_time = new Date().toISOString();
           next.max_pct = pct;
@@ -188,8 +204,9 @@ JS_HOOK = r"""
           next.pred_secs = taskSecs;
         } else {
           if (prev.max_pct >= THRESHOLD && pct <= 15) {
-            emitEvent(prev, id, devName, 'done', 100, fileName, taskId);
-            changed = true;
+            if (emitEvent(prev, id, devName, 'done', 100, fileName, taskId)) changed = true;
+            next.last_done_sig = prev.last_done_sig;
+            next.last_done_ms = prev.last_done_ms;
             next.start_time = new Date().toISOString();
             next.max_pct = pct;
             next.file = fileName;
@@ -198,8 +215,7 @@ JS_HOOK = r"""
             next.weight_g = taskWeight;
             next.pred_secs = taskSecs;
           } else if (prev.max_pct >= 1 && prev.max_pct < THRESHOLD && pct <= 5 && (prev.max_pct - pct) >= 15 && state === 'RUNNING') {
-            emitEvent(prev, id, devName, 'failed', prev.max_pct, fileName, taskId);
-            changed = true;
+            if (emitEvent(prev, id, devName, 'failed', prev.max_pct, fileName, taskId)) changed = true;
             next.start_time = new Date().toISOString();
             next.max_pct = pct;
             next.file = fileName;
@@ -221,27 +237,29 @@ JS_HOOK = r"""
         next.max_pct = Math.max(prev.max_pct || 0, pct);
       } else if (state === 'FINISH') {
         if (prev.active) {
-          emitEvent(prev, id, devName, 'done', 100, fileName, taskId);
-          changed = true;
+          if (emitEvent(prev, id, devName, 'done', 100, fileName, taskId)) changed = true;
+          next.last_done_sig = prev.last_done_sig;
+          next.last_done_ms = prev.last_done_ms;
         }
         next.active = false;
         next.max_pct = 0;
       } else if (state === 'FAILED') {
         if (prev.active) {
           const outcome = (prev.max_pct >= THRESHOLD) ? 'done' : 'failed';
-          emitEvent(prev, id, devName, outcome, prev.max_pct || pct, fileName, taskId);
-          changed = true;
+          if (emitEvent(prev, id, devName, outcome, prev.max_pct || pct, fileName, taskId)) changed = true;
+          next.last_done_sig = prev.last_done_sig;
+          next.last_done_ms = prev.last_done_ms;
         }
         next.active = false;
         next.max_pct = 0;
       } else if (state === 'IDLE') {
         if (prev.active) {
           if (prev.max_pct >= THRESHOLD) {
-            emitEvent(prev, id, devName, 'done', 100, fileName, taskId);
-            changed = true;
+            if (emitEvent(prev, id, devName, 'done', 100, fileName, taskId)) changed = true;
+            next.last_done_sig = prev.last_done_sig;
+            next.last_done_ms = prev.last_done_ms;
           } else if (prev.max_pct >= 1) {
-            emitEvent(prev, id, devName, 'failed', prev.max_pct, fileName, taskId);
-            changed = true;
+            if (emitEvent(prev, id, devName, 'failed', prev.max_pct, fileName, taskId)) changed = true;
           }
         }
         next.active = false;
@@ -296,8 +314,8 @@ JS_HOOK = r"""
     } catch (e) {}
   };
 
-  if (!window.__bambuHookedV7) {
-    window.__bambuHookedV7 = true;
+  if (!window.__bambuHookedV8) {
+    window.__bambuHookedV8 = true;
     const oOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (m, u) {
       this.__u = String(u);
@@ -492,7 +510,7 @@ def send_heartbeat(live: bool, ok: bool = True, msg: str = "ОК", last_save: st
         "done": int(done or 0),
         "fail": int(fail or 0),
     }
-    js = f"if(!window.__bambuHookedV7){{{JS_HOOK}}} if(window.__bambuSetHeartbeat){{window.__bambuSetHeartbeat({json.dumps(payload, ensure_ascii=False)});}}"
+    js = f"if(!window.__bambuHookedV8){{{JS_HOOK}}} if(window.__bambuSetHeartbeat){{window.__bambuSetHeartbeat({json.dumps(payload, ensure_ascii=False)});}}"
     return cdp_eval(js, timeout=4.0) is not None or True
 
 
@@ -584,9 +602,6 @@ def start_farm_with_hook(auto_mode=False):
     return False
 
 
-# ==============================================================================
-# АВТОНАСТРОЙКА СИСТЕМЫ: АВТОЗАГРУЗКА WINDOWS И ПАТЧ ЯРЛЫКОВ BAMBU
-# ==============================================================================
 PS_SHORTCUT_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 $mode = $env:BF_MODE
@@ -630,14 +645,14 @@ foreach ($d in $dirs) {
             $sc = $wsh.CreateShortcut($f.FullName)
             $tp = ($sc.TargetPath + '').ToLower()
             if ($tp.EndsWith($farmExe)) {
-                $args = ($sc.Arguments + '').Trim()
-                $cleanArgs = ($args -replace '--remote-allow-origins=\S*', '' -replace '--remote-debugging-port=\d+', '').Trim()
+                $curArgs = ($sc.Arguments + '').Trim()
+                $cleanArgs = ($curArgs -replace '--remote-allow-origins=\S*', '' -replace '--remote-debugging-port=\d+', '').Trim()
                 if ($mode -eq 'patch_bambu') {
                     $newArgs = if ($cleanArgs) { "$cleanArgs $portFlag" } else { $portFlag }
                 } else {
                     $newArgs = $cleanArgs
                 }
-                if ($args -ne $newArgs) {
+                if ($curArgs -ne $newArgs) {
                     $sc.Arguments = $newArgs
                     try {
                         $sc.Save()
@@ -693,16 +708,17 @@ def _run_ps_shortcut_helper(mode: str, elevate: bool = False):
             )
             return res.stdout or ""
         else:
-            wrapper = (
-                f"$env:BF_MODE='{mode}';"
-                f"$env:BF_PORT='{config.CDP_PORT}';"
-                f"$env:BF_FARM_EXE='{config.FARM_EXE_NAME}';"
-                f"& '{str(ps_file)}'"
+            inner_cmd = (
+                f'$env:BF_MODE="{mode}";'
+                f'$env:BF_PORT="{config.CDP_PORT}";'
+                f'$env:BF_FARM_EXE="{config.FARM_EXE_NAME}";'
+                f'& "{str(ps_file)}"'
             )
+            enc = base64.b64encode(inner_cmd.encode("utf-16le")).decode("ascii")
             subprocess.run(
                 [
                     "powershell", "-NoProfile", "-Command",
-                    f"Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command \"{wrapper}\"'"
+                    f'Start-Process powershell -Verb RunAs -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -EncodedCommand {enc}"'
                 ],
                 timeout=30,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),

@@ -308,11 +308,15 @@ def load_and_parse(quiet=False):
         odometers = config.load_odometers()
         devices_hw = arch.get("devices", {})
         metrics_by_file = {}
+        task_create_dt = {}
 
         for fn_low, mv in arch.get("metrics", {}).items():
             metrics_by_file[fn_low] = (fn_low, fn_low, safe_int(mv.get("s")), safe_float(mv.get("w")))
 
-        for t in arch.get("tasks", {}).values():
+        for tid, t in arch.get("tasks", {}).items():
+            ct = parse_iso_local(t.get("create_time")) or parse_iso_local(t.get("start_time"))
+            if ct:
+                task_create_dt[str(tid)] = ct
             f3mf = t.get("f3mf_info") if isinstance(t.get("f3mf_info"), dict) else {}
             raw_name = strip_ext(t.get("task_name") or f3mf.get("f3mf_name") or t.get("name") or "Unknown")
             clean_name, secs_one, weight_one = extract_metrics(t, raw_name)
@@ -347,23 +351,33 @@ def load_and_parse(quiet=False):
         live_fail_by_task = defaultdict(int)
         live_by_printer_dt = defaultdict(list)
 
-        # Сортируем живые события хронологически и вычищаем пост-финишные дубли
         sorted_events = sorted(
             arch.get("events", {}).items(),
             key=lambda kv: parse_iso_local(kv[1].get("finish_time")) or datetime.min
         )
+        seen_subtask_done = set()
+        seen_subtask_fail = set()
         last_done_by_printer_file = {}
-        dup_keys_to_purge = []
+        last_fail_by_printer_file = {}
+        bad_keys_to_purge = []
 
         for ev_key, ev in sorted_events:
             f_dt = parse_iso_local(ev.get("finish_time"))
             if not f_dt:
                 continue
+            s_dt = parse_iso_local(ev.get("start_time"))
+            dur_sec = (f_dt - s_dt).total_seconds() if s_dt else None
 
             dn = clean_str(ev.get("dev_name") or ev.get("dev_id") or "Unknown")
+            dev_id_key = (clean_str(ev.get("dev_id")) or dn).lower()
             outcome = "done" if ev.get("outcome") == "done" else "failed"
             pct = 100 if outcome == "done" else max(1, min(99, safe_int(ev.get("pct"), 50)))
             raw_ev_file = strip_ext(ev.get("file") or "")
+
+            # 1. Отсеиваем служебные калибровки принтера
+            if "auto_cali" in raw_ev_file.lower() or "calibration" in raw_ev_file.lower():
+                bad_keys_to_purge.append(ev_key)
+                continue
 
             weight_one = safe_float(ev.get("weight_g"))
             secs_one = safe_int(ev.get("pred_secs"))
@@ -383,15 +397,50 @@ def load_and_parse(quiet=False):
                 weight_one = weight_one or (w_n or 0.0)
                 secs_one = secs_one or (s_n or 0)
 
-            # Проверка на физически невозможный дубль финиша одного и того же файла на том же принтере
+            tid = str(ev.get("task_id") or "")
+            sub = str(ev.get("subtask_id") or "")
+
+            # 2. Отсеиваем фантомный "done" на старте печати (устаревший mc_percent=100% -> 0%)
             if outcome == "done":
-                pf_key = (dn.lower(), raw_ev_file.lower())
-                min_gap_sec = max(120, int(secs_one * 0.6)) if secs_one > 0 else 300
+                if tid and tid != "0" and tid in task_create_dt:
+                    since_create = (f_dt - task_create_dt[tid]).total_seconds()
+                    min_real = max(180, int(secs_one * 0.35)) if secs_one > 0 else 180
+                    if since_create < min_real:
+                        bad_keys_to_purge.append(ev_key)
+                        continue
+                elif dur_sec is not None and secs_one >= 600 and dur_sec <= 90:
+                    bad_keys_to_purge.append(ev_key)
+                    continue
+
+            # 3. Жёсткая дедупликация по subtask_id (отдельно для done и failed)
+            if sub and sub != "0":
+                sub_key = (dev_id_key, tid, sub)
+                if outcome == "done":
+                    if sub_key in seen_subtask_done:
+                        bad_keys_to_purge.append(ev_key)
+                        continue
+                    seen_subtask_done.add(sub_key)
+                else:
+                    if sub_key in seen_subtask_fail:
+                        bad_keys_to_purge.append(ev_key)
+                        continue
+                    seen_subtask_fail.add(sub_key)
+
+            # 4. Временная дедупликация по (принтер + файл) для done и failed
+            pf_key = (dev_id_key, raw_ev_file.lower())
+            if outcome == "done":
+                min_gap_sec = max(180, int(secs_one * 0.6)) if secs_one > 0 else 300
                 prev_dt = last_done_by_printer_file.get(pf_key)
                 if prev_dt and 0 <= (f_dt - prev_dt).total_seconds() < min_gap_sec:
-                    dup_keys_to_purge.append(ev_key)
+                    bad_keys_to_purge.append(ev_key)
                     continue
                 last_done_by_printer_file[pf_key] = f_dt
+            else:
+                prev_dt = last_fail_by_printer_file.get(pf_key)
+                if prev_dt and 0 <= (f_dt - prev_dt).total_seconds() < 600:
+                    bad_keys_to_purge.append(ev_key)
+                    continue
+                last_fail_by_printer_file[pf_key] = f_dt
 
             date_str = f_dt.strftime("%Y-%m-%d")
             if start_date_str and date_str < start_date_str:
@@ -401,8 +450,7 @@ def load_and_parse(quiet=False):
             used_weight = weight_one * ratio
             used_secs = int(secs_one * ratio)
 
-            tid = str(ev.get("task_id") or "")
-            if tid:
+            if tid and tid != "0":
                 if outcome == "done":
                     live_done_by_task[tid] += 1
                 else:
@@ -415,7 +463,7 @@ def load_and_parse(quiet=False):
                 printers_stat[dn]["weight_good"] += used_weight
                 add_printer_time(dn, f_dt, used_secs, is_waste=False)
                 ev_type = "Готово"
-                st_text = "Готово (100%)" if tid else "Повтор с принтера"
+                st_text = "Готово (100%)" if (tid and tid != "0") else "Повтор с принтера"
             else:
                 printers_stat[dn]["stopped_cnt"] += 1.0
                 printers_stat[dn]["weight_waste"] += used_weight
@@ -432,7 +480,7 @@ def load_and_parse(quiet=False):
                 "type": ev_type,
                 "status": st_text,
                 "is_failed": (outcome == "failed"),
-                "is_reprint": (outcome == "done" and not tid),
+                "is_reprint": (outcome == "done" and (not tid or tid == "0")),
                 "file": raw_ev_file or "Неизвестный файл",
                 "clean_name": clean_name,
                 "qty": 1,
@@ -444,13 +492,12 @@ def load_and_parse(quiet=False):
                 "printers": dn,
             })
 
-        # Удаляем найденные дубли из локального архива farm_archive.json
-        if dup_keys_to_purge:
-            for dk in dup_keys_to_purge:
+        if bad_keys_to_purge:
+            for dk in bad_keys_to_purge:
                 arch["events"].pop(dk, None)
             _save_archive(arch)
             if not quiet:
-                print(f"🧹 Автоочистка: удалено {len(dup_keys_to_purge)} дублирующихся записей из архива.")
+                print(f"🧹 Автоочистка: удалено {len(bad_keys_to_purge)} дублей/фантомных записей из farm_archive.json.")
 
         for tid, t in arch.get("tasks", {}).items():
             stats = t.get("statistics") if isinstance(t.get("statistics"), dict) else {}
